@@ -804,177 +804,19 @@ bool GoogleDriveProvider::Upload(const std::string& path,
 }
 
 bool GoogleDriveProvider::UploadBatch(const std::vector<UploadItem>& items) {
-    if (items.empty()) return true;
-    if (items.size() == 1) {
-        return Upload(items[0].path, items[0].data.data(), items[0].data.size());
-    }
-
-    // Google Drive batch API: max 100 requests per batch, max ~10 MB payload
-    constexpr size_t MAX_BATCH_SIZE = 100;
-    
+    // Google Drive batch API does not support file upload (multipart/related)
+    // requests -- only metadata-only operations. Use individual Upload() calls.
     std::vector<std::string> uploadedPaths;
-    
-    for (size_t batchStart = 0; batchStart < items.size(); batchStart += MAX_BATCH_SIZE) {
-        size_t batchEnd = (std::min)(batchStart + MAX_BATCH_SIZE, items.size());
-        size_t batchCount = batchEnd - batchStart;
-
-        auto token = GetAccessToken();
-        if (token.empty()) {
-
-            for (const auto& path : uploadedPaths) {
-                Remove(path);
-            }
-            return false;
-        }
-
-
-        char randHex[33];
-        uint8_t randBytes[16];
-        {
-#ifdef _WIN32
-            BCryptGenRandom(NULL, randBytes, 16, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-#else
-            std::ifstream urandom("/dev/urandom", std::ios::binary);
-            if (urandom) {
-                urandom.read(reinterpret_cast<char*>(randBytes), 16);
-            } else {
-                auto seed = std::chrono::steady_clock::now().time_since_epoch().count();
-                std::mt19937 rng(static_cast<unsigned>(seed));
-                for (int i = 0; i < 16; i++)
-                    randBytes[i] = (uint8_t)(rng() & 0xFF);
-            }
-#endif
-            for (int i = 0; i < 16; i++)
-                snprintf(randHex + i * 2, 3, "%02x", randBytes[i]);
-        }
-        std::string batchBoundary = std::string("batch_") + randHex;
-
-        std::string batchBody;
-        batchBody.reserve(batchCount * 2048); // rough estimate
-
-        for (size_t i = batchStart; i < batchEnd; ++i) {
-            const auto& item = items[i];
-            
-            uint32_t accountId, appId;
-            std::string relFilename;
-            if (!ParsePath(item.path, accountId, appId, relFilename) || relFilename.empty()) {
-                LOG("[GDriveProvider] UploadBatch: bad path '%s'", item.path.c_str());
-                for (const auto& path : uploadedPaths) {
-                    Remove(path);
-                }
-                return false;
-            }
-
-            std::string parentId, leafName;
-            if (ResolvePath(accountId, appId, relFilename, parentId, leafName, /*create=*/true) != LookupStatus::Exists) {
-                LOG("[GDriveProvider] UploadBatch: failed to resolve path '%s'", item.path.c_str());
-                for (const auto& path : uploadedPaths) {
-                    Remove(path);
-                }
-                return false;
-            }
-
-            auto existingId = FindFileInFolder(leafName, parentId);
-
-            auto meta = Json::Object();
-            meta.objVal["name"] = Json::String(leafName);
-            if (existingId.empty()) {
-                auto arr = Json::Array();
-                arr.arrVal.push_back(Json::String(parentId));
-                meta.objVal["parents"] = std::move(arr);
-            }
-            std::string metaJson = Json::Stringify(meta);
-
-            char innerRandHex[17];
-            size_t offset = (i - batchStart) % 9;  // Use different offset per file
-            for (int j = 0; j < 8; j++)
-                snprintf(innerRandHex + j * 2, 3, "%02x", randBytes[(j + offset) % 16]);
-            std::string innerBoundary = std::string("file_") + innerRandHex;
-
-            std::string innerBody;
-            innerBody += "--"; innerBody += innerBoundary; innerBody += "\r\n";
-            innerBody += "Content-Type: application/json; charset=UTF-8\r\n\r\n";
-            innerBody += metaJson;
-            innerBody += "\r\n--"; innerBody += innerBoundary; innerBody += "\r\n";
-            innerBody += "Content-Type: application/octet-stream\r\n\r\n";
-            innerBody.append((const char*)item.data.data(), item.data.size());
-            innerBody += "\r\n--"; innerBody += innerBoundary; innerBody += "--\r\n";
-
-            std::string method;
-            std::string uploadPath;
-            if (existingId.empty()) {
-                method = "POST";
-                uploadPath = "/upload/drive/v3/files?uploadType=multipart&fields=id";
-            } else {
-                method = "PATCH";
-                uploadPath = "/upload/drive/v3/files/" + existingId + "?uploadType=multipart&fields=id";
-            }
-
-            batchBody += "--"; batchBody += batchBoundary; batchBody += "\r\n";
-            batchBody += "Content-Type: application/http\r\n";
-            batchBody += "Content-ID: <item"; batchBody += std::to_string(i - batchStart); batchBody += ">\r\n\r\n";
-            batchBody += method; batchBody += " "; batchBody += uploadPath; batchBody += " HTTP/1.1\r\n";
-            batchBody += "Host: www.googleapis.com\r\n";
-            batchBody += "Content-Type: multipart/related; boundary="; batchBody += innerBoundary; batchBody += "\r\n";
-            batchBody += "Content-Length: "; batchBody += std::to_string(innerBody.size()); batchBody += "\r\n\r\n";
-            batchBody += innerBody;
-        }
-
-        batchBody += "--"; batchBody += batchBoundary; batchBody += "--\r\n";
-
-        std::vector<std::string> headers = {
-            "Authorization: Bearer " + token,
-            "Content-Type: multipart/mixed; boundary=" + batchBoundary
-        };
-
-        HttpResp r;
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            if (attempt > 0) {
-                std::this_thread::sleep_for(std::chrono::seconds(attempt));
-                token = GetAccessToken();
-                if (token.empty()) {
-                    for (const auto& path : uploadedPaths) Remove(path);
-                    return false;
-                }
-                headers[0] = "Authorization: Bearer " + token;
-            }
-            ThrottleApiCall();
-            r = Request("POST", "www.googleapis.com", "/batch/drive/v3", batchBody, headers);
-            if (!IsRateLimited(r.status, r.body)) break;
-            LOG("[GDrive] Batch rate limited (attempt %d), backing off %ds",
-                attempt + 1, attempt + 1);
-        }
-
-        if (r.status < 200 || r.status >= 300) {
-            LOG("[GDriveProvider] UploadBatch failed: HTTP %d", r.status);
+    for (const auto& item : items) {
+        if (!Upload(item.path, item.data.data(), item.data.size())) {
+            LOG("[GDriveProvider] UploadBatch: failed to upload '%s', rolling back %zu prior upload(s)",
+                item.path.c_str(), uploadedPaths.size());
             for (const auto& path : uploadedPaths) Remove(path);
             return false;
         }
-
-        // Scan batch response for 4xx/5xx status lines (multipart/mixed, each part has its own HTTP status)
-        size_t pos = 0;
-        while ((pos = r.body.find("HTTP/1.1 ", pos)) != std::string::npos) {
-            bool atLineStart = (pos == 0) || (r.body[pos - 1] == '\n');
-            if (atLineStart && pos + 12 < r.body.size()) {
-                char statusChar = r.body[pos + 9];
-                if ((statusChar == '4' || statusChar == '5') && 
-                    std::isdigit(static_cast<unsigned char>(r.body[pos + 10])) && 
-                    std::isdigit(static_cast<unsigned char>(r.body[pos + 11]))) {
-                    LOG("[GDriveProvider] UploadBatch: one or more uploads failed in batch");
-                    for (const auto& path : uploadedPaths) Remove(path);
-                    return false;
-                }
-            }
-            pos += 9;
-        }
-
-        for (size_t i = batchStart; i < batchEnd; ++i) {
-            uploadedPaths.push_back(items[i].path);
-        }
-
-        LOG("[GDriveProvider] UploadBatch: uploaded %zu files", batchCount);
+        uploadedPaths.push_back(item.path);
     }
-
+    LOG("[GDriveProvider] UploadBatch: uploaded %zu files individually", items.size());
     return true;
 }
 
