@@ -1,4 +1,4 @@
-# CloudRedirect
+# Cloud Redirect
 
 ""Steam Cloud"" for 'lua' games. Now for Linux!
 
