@@ -304,7 +304,7 @@ void RecordResumeState(uint32_t accountId, uint32_t appId,
         currentSession = Entry{};
         currentSession->machineName = "(recovered)";
     }
-    // Capture old clientId before updating — suspend writes UploadPending
+    // Capture old clientId before updating -- suspend writes UploadPending
     // entries with the pre-suspend clientId, so resume must clear both.
     uint64_t oldClientId = currentSession->clientId;
     if (clientId != 0) currentSession->clientId = clientId;
@@ -354,6 +354,23 @@ std::optional<Entry> LoadCurrentSession(uint32_t accountId, uint32_t appId) {
     std::optional<Entry> currentSession;
     LoadEntriesUnlocked(accountId, appId, &currentSession);
     return currentSession;
+}
+
+bool HasPendingUpload(uint32_t accountId, uint32_t appId) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto entries = LoadEntriesUnlocked(accountId, appId);
+    for (const auto& entry : entries) {
+        if (entry.operation == Operation::UploadPending) return true;
+    }
+    return false;
+}
+
+void ClearUploadPending(uint32_t accountId, uint32_t appId) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    std::optional<Entry> currentSession;
+    auto entries = LoadEntriesUnlocked(accountId, appId, &currentSession);
+    RemoveOperation(entries, Operation::UploadPending);
+    SaveStateUnlocked(accountId, appId, entries, currentSession);
 }
 
 void ClearPending(uint32_t accountId, uint32_t appId) {

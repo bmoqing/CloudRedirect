@@ -1,4 +1,5 @@
 #include "cloud_storage.h"
+#include "app_state.h"
 #include "local_storage.h"
 #include "local_disk_provider.h"
 #include "google_drive_provider.h"
@@ -55,6 +56,14 @@ static std::mutex                        g_mutex;
 // Cache confirmed-missing metadata paths to avoid repeated API round trips.
 static std::mutex                        g_missingMetadataMutex;
 static std::unordered_set<std::string>   g_missingMetadataPaths;
+
+// Per-app blob path index: maps filename -> resolved cloud path (avoids fallback chain).
+static std::mutex                        g_blobIndexMutex;
+struct BlobIndex {
+    std::unordered_map<std::string, std::string> filenameToPath; // filename -> full cloud path
+    bool populated = false;
+};
+static std::unordered_map<uint64_t, BlobIndex> g_blobIndex; // key = (accountId<<32)|appId
 
 // Serializes token persistence (root_token.dat, file_tokens.dat) across
 // concurrent callers (rpc_handlers batch operations, AutoCloudBootstrap).
@@ -132,12 +141,16 @@ std::shared_ptr<std::mutex> AcquireAppSyncMutex(uint32_t accountId, uint32_t app
 }
 
 // Show an immediate dialog for critical auth failures (token refresh broken).
+// Guarded by std::once_flag so the user sees it at most once per Steam session.
+static std::once_flag g_authFailureOnce;
 void NotifyAuthFailure(const std::string& providerName) {
-    CloudWorkQueue::ShowErrorDialog(
-        providerName + " authentication failed!\n\n"
-        "CloudRedirect cannot refresh your access token.\n"
-        "Cloud sync is disabled until this is resolved.\n\n"
-        "Re-authenticate using the CloudRedirect setup tool.");
+    std::call_once(g_authFailureOnce, [&providerName] {
+        CloudWorkQueue::ShowErrorDialog(
+            providerName + " authentication failed!\n\n"
+            "CloudRedirect cannot refresh your access token.\n"
+            "Cloud sync is disabled until this is resolved.\n\n"
+            "Re-authenticate using the CloudRedirect setup tool.");
+    });
 }
 
 // WorkItem/EnqueueWork/queue infra moved to cloud_work_queue.h/.cpp.
@@ -248,6 +261,35 @@ static void RemoveLocalBlobsNotInCloud(uint32_t accountId, uint32_t appId,
 }
 
 
+// Hex-encode a 20-byte SHA1 as a 40-char lowercase hex string.
+static std::string ShaToHex(const std::vector<uint8_t>& sha) {
+    std::string hex;
+    hex.reserve(sha.size() * 2);
+    for (uint8_t b : sha) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02x", b);
+        hex += buf;
+    }
+    return hex;
+}
+
+// CAS blob path: "{accountId}/{appId}/blobs/{filename}/{sha1hex}"
+static std::string CloudBlobPathByNameAndSHA(uint32_t accountId, uint32_t appId,
+                                             const std::string& filename,
+                                             const std::string& shaHex) {
+    return std::to_string(accountId) + "/" + std::to_string(appId) +
+           "/blobs/" + filename + "/" + shaHex;
+}
+
+// Legacy CAS path: "{account}/{app}/blobs/{sha1hex}" (migration read-only)
+static std::string CloudBlobPathBySHA(uint32_t accountId, uint32_t appId,
+                                      const std::string& shaHex) {
+    return std::to_string(accountId) + "/" + std::to_string(appId) +
+           "/blobs/" + shaHex;
+}
+
+// Filename-addressed path. Used for account-scope metadata (appId=0) and
+// pre-CAS legacy blobs.
 // Cloud provider paths use forward slashes: "{accountId}/{appId}/blobs/{filename}"
 static std::string CloudBlobPath(uint32_t accountId, uint32_t appId,
                                  const std::string& filename) {
@@ -330,7 +372,8 @@ static void EnumerateLocalAccountMetadataAppIds(const std::filesystem::path& acc
     }
 }
 
-// Inverse of CloudBlobPath. Rejects metadata paths and any non-canonical decimal.
+// Extract logical filename from a blob path, stripping SHA leaf for canonical paths.
+// Returns trailing component as-is for legacy layouts.
 bool ParseCloudBlobPath(const std::string& cloudPath,
                                uint32_t& accountId, uint32_t& appId,
                                std::string& filename) {
@@ -345,8 +388,21 @@ bool ParseCloudBlobPath(const std::string& cloudPath,
 
     if (!ParseU32(cloudPath.substr(0, p1), accountId)) return false;
     if (!ParseU32(cloudPath.substr(p1 + 1, p2 - p1 - 1), appId)) return false;
-    filename = cloudPath.substr(fileStart);
-    return !filename.empty();
+    std::string rest = cloudPath.substr(fileStart);
+    if (rest.empty()) return false;
+
+    // Canonical: blobs/{filename}/{sha}. Strip SHA leaf if present.
+    size_t lastSlash = rest.rfind('/');
+    if (lastSlash != std::string::npos && lastSlash + 1 < rest.size()) {
+        std::string leaf = rest.substr(lastSlash + 1);
+        if (leaf.size() == 40 &&
+            leaf.find_first_not_of("0123456789abcdef") == std::string::npos) {
+            filename = rest.substr(0, lastSlash);
+            return !filename.empty();
+        }
+    }
+    filename = std::move(rest);
+    return true;
 }
 
 static bool ParseCloudStagedBlobPath(const std::string& cloudPath,
@@ -507,7 +563,6 @@ static void EnqueueCloudDelete(const std::string& cloudPath) {
     CloudWorkQueue::WorkItem wi;
     wi.type = CloudWorkQueue::WorkItem::Delete;
     wi.cloudPath = cloudPath;
-    wi.suppressTombstoneClear = true;
     CloudWorkQueue::EnqueueWork(std::move(wi));
 }
 
@@ -670,7 +725,7 @@ void PushCNToCloud(uint32_t accountId, uint32_t appId, uint64_t cn) {
 bool PushCNToCloudSync(uint32_t accountId, uint32_t appId, uint64_t cn) {
     InflightSyncScope guard;
     if (!guard) return false;
-    if (!g_provider) return true;
+    if (!g_provider) return false;
     std::string cnStr = std::to_string(cn);
     if (!UploadCloudMetadataText(accountId, appId, kCNFilename, cnStr)) {
         return false;
@@ -708,9 +763,6 @@ uint64_t FetchCloudCN(uint32_t accountId, uint32_t appId) {
         return 0;
     }
 }
-
-// ============================================================================
-
 
 
 bool CommitCNWithRetry(uint32_t accountId, uint32_t appId, uint64_t cn) {
@@ -830,6 +882,10 @@ void Init(const std::string& localRoot, std::unique_ptr<ICloudProvider> provider
         std::lock_guard<std::mutex> missingLock(g_missingMetadataMutex);
         g_missingMetadataPaths.clear();
     }
+    {
+        std::lock_guard<std::mutex> lk(g_blobIndexMutex);
+        g_blobIndex.clear();
+    }
     // Do NOT zero g_foregroundSyncCount: a late ForegroundSyncScope dtor
     // would underflow it; the counter self-balances across restart.
 
@@ -837,6 +893,7 @@ void Init(const std::string& localRoot, std::unique_ptr<ICloudProvider> provider
 
     ManifestStore_Init(g_localRoot, g_provider.get());
     TokenStore_Init(g_localRoot, g_provider.get());
+    AppState_Init(g_provider.get());
 
     LOG("[CloudStorage] Initialized. localRoot=%s provider=%s",
         g_localRoot.c_str(), g_provider ? g_provider->Name() : "none (local-only)");
@@ -898,6 +955,7 @@ void Shutdown() {
     // but before destroying the provider.
     ManifestStore_Init("", nullptr);
     TokenStore_Init("", nullptr);
+    AppState_Shutdown();
 
     if (g_provider) {
         g_provider->Shutdown();
@@ -911,7 +969,6 @@ bool IsCloudActive() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_provider && g_provider->IsAuthenticated();
 }
-
 
 bool StoreBlob(uint32_t accountId, uint32_t appId,
                const std::string& filename,
@@ -950,6 +1007,10 @@ static void PruneStaleCloudStaging(uint32_t accountId) {
     }
 }
 
+static bool TryReadCachedBlob(const std::string& localPath,
+                              const std::string& filename,
+                              std::vector<uint8_t>& out);
+
 bool StoreBlobStaged(uint32_t accountId, uint32_t appId, uint64_t batchId,
                      const std::string& filename,
                      const uint8_t* data, size_t len) {
@@ -957,6 +1018,20 @@ bool StoreBlobStaged(uint32_t accountId, uint32_t appId, uint64_t batchId,
         LOG("[CloudStorage] StoreBlob: rejecting reserved /blobs/ filename app=%u batch=%llu file=%s",
             appId, (unsigned long long)batchId, filename.c_str());
         return false;
+    }
+
+    // Skip re-write if cached blob has identical content (dedup by SHA).
+    std::string localPath = LocalBlobPath(accountId, appId, filename);
+    if (!localPath.empty()) {
+        std::vector<uint8_t> cached;
+        if (TryReadCachedBlob(localPath, filename, cached)) {
+            if (cached.size() == len &&
+                (len == 0 || std::memcmp(cached.data(), data, len) == 0)) {
+                LOG("[CloudStorage] StoreBlob: already cached with identical content, skipping write: %s (%zu bytes)",
+                    filename.c_str(), len);
+                return true;
+            }
+        }
     }
 
     // Synchronous local write via LocalStorage::WriteFileNoIncrement so it
@@ -968,16 +1043,21 @@ bool StoreBlobStaged(uint32_t accountId, uint32_t appId, uint64_t batchId,
     }
     LOG("[CloudStorage] StoreBlob: cached locally: %s (%zu bytes)", filename.c_str(), len);
 
-    // Drop any stale tombstone (canonicalized to match DeleteBlob's MarkDeleted key).
-    LocalMetadataStore::ClearDeleted(accountId, appId,
-                               CanonicalizeInternalMetadataName(filename));
-
     // CN is incremented once per batch in HandleCompleteBatch, not per file.
 
     if (g_provider && batchId == 0) {
         CloudWorkQueue::WorkItem wi;
         wi.type = CloudWorkQueue::WorkItem::Upload;
-        wi.cloudPath = CloudBlobPath(accountId, appId, filename);
+        if (appId == CloudIntercept::kAccountScopeAppId) {
+            // Account-scope metadata: filename-addressed, no CAS.
+            wi.cloudPath = CloudBlobPath(accountId, appId, filename);
+        } else {
+            // CAS: upload to blobs/{filename}/{sha}.
+            auto sha = FileUtil::SHA1(data, len);
+            std::string shaHex = ShaToHex(sha);
+            wi.cloudPath = CloudBlobPathByNameAndSHA(accountId, appId, filename, shaHex);
+            wi.skipIfExists = true;
+        }
         wi.data.assign(data, data + len);
         CloudWorkQueue::EnqueueWork(std::move(wi));
     }
@@ -1014,9 +1094,93 @@ static bool TryReadCachedBlob(const std::string& localPath,
     return true;
 }
 
+// Resolve the actual cloud path for a blob by consulting the per-app index.
+// Populates the index with a single ListChecked on first call per app.
+// Returns empty string if the blob is not found in the listing.
+static std::string ResolveBlobCloudPath(uint32_t accountId, uint32_t appId,
+                                        const std::string& filename) {
+    uint64_t key = (static_cast<uint64_t>(accountId) << 32) | appId;
+    {
+        std::lock_guard<std::mutex> lk(g_blobIndexMutex);
+        auto it = g_blobIndex.find(key);
+        if (it != g_blobIndex.end() && it->second.populated) {
+            auto fit = it->second.filenameToPath.find(filename);
+            if (fit != it->second.filenameToPath.end())
+                return fit->second;
+            return {};
+        }
+    }
+
+    // Not populated yet -- list all blobs for this app.
+    std::string blobPrefix = std::to_string(accountId) + "/" +
+                             std::to_string(appId) + "/blobs/";
+    std::vector<ICloudProvider::FileInfo> remoteBlobs;
+    bool complete = false;
+    if (!g_provider || !g_provider->ListChecked(blobPrefix, remoteBlobs, &complete) || !complete) {
+        return {}; // listing failed; caller falls through to trial-and-error
+    }
+
+    LOG("[CloudStorage] BlobIndex: listed %zu blobs for acct %u app %u",
+        remoteBlobs.size(), accountId, appId);
+
+    BlobIndex idx;
+    idx.populated = true;
+
+    auto isHexSha = [](const std::string& s) {
+        return s.size() == 40 &&
+               s.find_first_not_of("0123456789abcdef") == std::string::npos;
+    };
+
+    for (const auto& fi : remoteBlobs) {
+        if (fi.path.size() <= blobPrefix.size()) continue;
+        std::string rel = fi.path.substr(blobPrefix.size());
+
+        // Canonical CAS: filename/sha (leaf is 40-char hex)
+        size_t lastSlash = rel.rfind('/');
+        if (lastSlash != std::string::npos) {
+            std::string leaf = rel.substr(lastSlash + 1);
+            if (isHexSha(leaf)) {
+                std::string fname = rel.substr(0, lastSlash);
+                // Canonical always wins over legacy (unconditional overwrite).
+                idx.filenameToPath[fname] = fi.path;
+                continue;
+            }
+        }
+
+        // Legacy SHA-only: blobs/{sha}
+        if (isHexSha(rel)) continue; // can't map to filename without manifest
+
+        // Legacy filename-only: blobs/{filename} -- only if canonical not already set.
+        idx.filenameToPath.emplace(rel, fi.path);
+    }
+
+    std::string result;
+    auto fit = idx.filenameToPath.find(filename);
+    if (fit != idx.filenameToPath.end())
+        result = fit->second;
+
+    {
+        std::lock_guard<std::mutex> lk(g_blobIndexMutex);
+        // Only store if not already populated (avoids overwriting a fresher index
+        // from a concurrent thread or re-inserting after invalidation).
+        auto existing = g_blobIndex.find(key);
+        if (existing == g_blobIndex.end() || !existing->second.populated)
+            g_blobIndex[key] = std::move(idx);
+    }
+    return result;
+}
+
+// Invalidate the blob index for an app (called after uploads/promotions change the layout).
+static void InvalidateBlobIndex(uint32_t accountId, uint32_t appId) {
+    uint64_t key = (static_cast<uint64_t>(accountId) << 32) | appId;
+    std::lock_guard<std::mutex> lk(g_blobIndexMutex);
+    g_blobIndex.erase(key);
+}
+
 std::vector<uint8_t> RetrieveBlob(uint32_t accountId, uint32_t appId,
-                                  const std::string& filename,
-                                  bool* found) {
+                                   const std::string& filename,
+                                   bool* found,
+                                   const std::string& expectedShaHex) {
     if (found) *found = false;
     
     std::string localPath = LocalBlobPath(accountId, appId, filename);
@@ -1025,50 +1189,226 @@ std::vector<uint8_t> RetrieveBlob(uint32_t accountId, uint32_t appId,
     InflightSyncScope guard;
     const bool cloudActive = guard && g_provider;
 
-    // Cloud-first: always fetch from cloud when active.
-    // The manifest system means we already know what files exist and their SHA.
-    // Steam only requests files that need syncing, so fetch fresh from cloud.
-    // Local cache is just a fallback for network errors.
-    if (cloudActive) {
+    // Account-scope: filename-addressed.
+    if (cloudActive && appId == CloudIntercept::kAccountScopeAppId) {
         std::string cloudPath = CloudBlobPath(accountId, appId, filename);
         std::vector<uint8_t> data;
         if (g_provider->Download(cloudPath, data)) {
-            LOG("[CloudStorage] RetrieveBlob: fetched from cloud: %s (%zu bytes)",
+            LOG("[CloudStorage] RetrieveBlob: fetched account-scope blob: %s (%zu bytes)",
                 filename.c_str(), data.size());
-            // Update local cache
             const uint8_t* writeData = data.empty() ? nullptr : data.data();
-            if (!LocalStorage::WriteFileNoIncrement(accountId, appId, filename,
-                                               writeData, data.size())) {
-                LOG("[CloudStorage] RetrieveBlob: WARNING - failed to cache %s locally, serving from cloud only",
-                    filename.c_str());
-            }
+            LocalStorage::WriteFileNoIncrement(accountId, appId, filename, writeData, data.size());
             if (found) *found = true;
             return data;
         }
-        
-        // Cloud download failed - check if file is missing vs network error
-        auto status = g_provider->CheckExists(cloudPath);
-        if (status == ICloudProvider::ExistsStatus::Missing) {
-            // File doesn't exist in cloud - check local cache as fallback
-            // (may be a file that was just uploaded locally but not yet synced)
+        // Fall through to local cache
+        std::vector<uint8_t> cached;
+        if (TryReadCachedBlob(localPath, filename, cached)) {
+            LOG("[CloudStorage] RetrieveBlob: serving account-scope from cache: %s (%zu bytes)",
+                filename.c_str(), cached.size());
+            if (found) *found = true;
+            return cached;
+        }
+        LOG("[CloudStorage] RetrieveBlob: account-scope blob not found: %s", filename.c_str());
+        return {};
+    }
+
+    // CAS: resolve filename->SHA from manifest, download by SHA.
+    if (cloudActive) {
+        Manifest manifest = LoadLocalManifest(accountId, appId);
+        auto mit = manifest.find(filename);
+        std::string shaHex;
+        if (mit != manifest.end() && !mit->second.sha.empty()) {
+            shaHex = ShaToHex(mit->second.sha);
+        }
+
+        // Cache-first: caller supplied cloud-authoritative SHA (from FetchCloudState).
+        // If local blob matches, skip network entirely.
+        if (!expectedShaHex.empty() && expectedShaHex == shaHex) {
             std::vector<uint8_t> cached;
-            if (TryReadCachedBlob(localPath, filename, cached)) {
-                LOG("[CloudStorage] RetrieveBlob: not in cloud, using local cache: %s (%zu bytes)",
+            if (TryReadCachedBlob(localPath, filename, cached) &&
+                ShaToHex(FileUtil::SHA1(cached.data(), cached.size())) == expectedShaHex) {
+                LOG("[CloudStorage] RetrieveBlob: cache hit (cloud SHA match): %s (%zu bytes)",
                     filename.c_str(), cached.size());
                 if (found) *found = true;
                 return cached;
             }
-            LOG("[CloudStorage] RetrieveBlob: not found in cloud: %s", filename.c_str());
+        }
+
+        if (!shaHex.empty()) {
+            std::vector<uint8_t> data;
+            std::string canonicalPath = CloudBlobPathByNameAndSHA(accountId, appId, filename, shaHex);
+
+            // Fast path: use blob index to resolve actual path in one call.
+            std::string resolved = ResolveBlobCloudPath(accountId, appId, filename);
+            if (!resolved.empty() && g_provider->Download(resolved, data)) {
+                // Verify content SHA matches the manifest-expected hash.
+                std::string actualSha = ShaToHex(FileUtil::SHA1(data.data(), data.size()));
+                if (actualSha != shaHex) {
+                    LOG("[CloudStorage] RetrieveBlob: SHA MISMATCH via index %s: expected=%s actual=%s, rejecting",
+                        resolved.c_str(), shaHex.c_str(), actualSha.c_str());
+                    data.clear();
+                    // Fall through to the manual fallback paths below.
+                } else {
+                bool isCanonical = (resolved == canonicalPath);
+                LOG("[CloudStorage] RetrieveBlob: fetched via index (%s): %s (%zu bytes)",
+                    isCanonical ? "CAS" : "legacy", filename.c_str(), data.size());
+                const uint8_t* writeData = data.empty() ? nullptr : data.data();
+                LocalStorage::WriteFileNoIncrement(accountId, appId, filename, writeData, data.size());
+                // Promote non-canonical to CAS in background.
+                // (actualSha already verified == shaHex above)
+                if (!isCanonical) {
+                    CloudWorkQueue::WorkItem upload;
+                    upload.type = CloudWorkQueue::WorkItem::Upload;
+                    upload.cloudPath = canonicalPath;
+                    upload.data = data;
+                    upload.bestEffort = true;
+                    CloudWorkQueue::EnqueueWork(std::move(upload));
+
+                    CloudWorkQueue::WorkItem del;
+                    del.type = CloudWorkQueue::WorkItem::Delete;
+                    del.cloudPath = resolved;
+                    del.bestEffort = true;
+                    CloudWorkQueue::EnqueueWork(std::move(del));
+                }
+                if (found) *found = true;
+                return data;
+                } // end SHA-match else
+            }
+
+            // Fallback: index miss or download failed -- try each path variant.
+
+            // 1. Canonical: blobs/{filename}/{sha}
+            if (g_provider->Download(canonicalPath, data)) {
+                // SHA verification: provider should serve content matching
+                // the SHA-addressed path. Mismatch indicates provider corruption or bug.
+                std::string actualSha = ShaToHex(FileUtil::SHA1(data.data(), data.size()));
+                if (actualSha != shaHex) {
+                    LOG("[CloudStorage] RetrieveBlob: SHA MISMATCH on canonical path %s: expected=%s actual=%s, rejecting",
+                        canonicalPath.c_str(), shaHex.c_str(), actualSha.c_str());
+                    data.clear();
+                } else {
+                    LOG("[CloudStorage] RetrieveBlob: fetched from cloud (CAS %s): %s (%zu bytes)",
+                        shaHex.c_str(), filename.c_str(), data.size());
+                    const uint8_t* writeData = data.empty() ? nullptr : data.data();
+                    if (!LocalStorage::WriteFileNoIncrement(accountId, appId, filename,
+                                                        writeData, data.size())) {
+                        LOG("[CloudStorage] RetrieveBlob: WARNING - failed to cache %s locally, serving from cloud only",
+                            filename.c_str());
+                    }
+                    if (found) *found = true;
+                    return data;
+                }
+            }
+
+            // 2. Legacy CAS layout: blobs/{sha} (from previous SHA-only CAS).
+            std::string legacyShaPath = CloudBlobPathBySHA(accountId, appId, shaHex);
+            if (g_provider->Download(legacyShaPath, data)) {
+                std::string actualSha = ShaToHex(FileUtil::SHA1(data.data(), data.size()));
+                if (actualSha != shaHex) {
+                    LOG("[CloudStorage] RetrieveBlob: SHA MISMATCH on legacy CAS path %s: expected=%s actual=%s, rejecting",
+                        legacyShaPath.c_str(), shaHex.c_str(), actualSha.c_str());
+                    data.clear();
+                } else {
+                    LOG("[CloudStorage] RetrieveBlob: fetched from legacy CAS path (sha=%s): %s (%zu bytes)",
+                        shaHex.c_str(), filename.c_str(), data.size());
+                    const uint8_t* writeData = data.empty() ? nullptr : data.data();
+                    if (!LocalStorage::WriteFileNoIncrement(accountId, appId, filename,
+                                                        writeData, data.size())) {
+                        LOG("[CloudStorage] RetrieveBlob: WARNING - failed to cache %s locally (legacy CAS fallback)",
+                            filename.c_str());
+                    }
+                    // Promote to canonical CAS path in background.
+                    CloudWorkQueue::WorkItem upload;
+                    upload.type = CloudWorkQueue::WorkItem::Upload;
+                    upload.cloudPath = canonicalPath;
+                    upload.data = data;
+                    upload.bestEffort = true;
+                    CloudWorkQueue::EnqueueWork(std::move(upload));
+
+                    CloudWorkQueue::WorkItem del;
+                    del.type = CloudWorkQueue::WorkItem::Delete;
+                    del.cloudPath = legacyShaPath;
+                    del.bestEffort = true;
+                    CloudWorkQueue::EnqueueWork(std::move(del));
+
+                    if (found) *found = true;
+                    return data;
+                }
+            }
+
+            // 3. Pre-CAS legacy: blobs/{filename}
+            std::string legacyPath = CloudBlobPath(accountId, appId, filename);
+            if (g_provider->Download(legacyPath, data)) {
+                std::string actualSha = ShaToHex(FileUtil::SHA1(data.data(), data.size()));
+                if (actualSha != shaHex) {
+                    LOG("[CloudStorage] RetrieveBlob: SHA MISMATCH on legacy path %s: expected=%s actual=%s, rejecting",
+                        legacyPath.c_str(), shaHex.c_str(), actualSha.c_str());
+                    data.clear();
+                } else {
+                    LOG("[CloudStorage] RetrieveBlob: fetched from legacy filename path: %s (%zu bytes)",
+                        filename.c_str(), data.size());
+                    const uint8_t* writeData = data.empty() ? nullptr : data.data();
+                    if (!LocalStorage::WriteFileNoIncrement(accountId, appId, filename,
+                                                        writeData, data.size())) {
+                        LOG("[CloudStorage] RetrieveBlob: WARNING - failed to cache %s locally (legacy fallback)",
+                            filename.c_str());
+                    }
+                    // Promote to CAS in background so next download hits on first try.
+                    CloudWorkQueue::WorkItem upload;
+                    upload.type = CloudWorkQueue::WorkItem::Upload;
+                    upload.cloudPath = canonicalPath;
+                    upload.data = data;
+                    upload.bestEffort = true;
+                    CloudWorkQueue::EnqueueWork(std::move(upload));
+
+                    CloudWorkQueue::WorkItem del;
+                    del.type = CloudWorkQueue::WorkItem::Delete;
+                    del.cloudPath = legacyPath;
+                    del.bestEffort = true;
+                    CloudWorkQueue::EnqueueWork(std::move(del));
+
+                    if (found) *found = true;
+                    return data;
+                }
+            }
         } else {
-            // Network error - fall back to local cache
-            std::vector<uint8_t> cached;
-            if (TryReadCachedBlob(localPath, filename, cached)) {
-                LOG("[CloudStorage] RetrieveBlob: cloud error, using local cache: %s (%zu bytes)",
+            // No SHA in manifest -- try legacy filename path.
+            std::string legacyPath = CloudBlobPath(accountId, appId, filename);
+            std::vector<uint8_t> data;
+            if (g_provider->Download(legacyPath, data)) {
+                LOG("[CloudStorage] RetrieveBlob: fetched from legacy path (no manifest SHA): %s (%zu bytes)",
+                    filename.c_str(), data.size());
+                const uint8_t* writeData = data.empty() ? nullptr : data.data();
+                if (!LocalStorage::WriteFileNoIncrement(accountId, appId, filename,
+                                                    writeData, data.size())) {
+                    LOG("[CloudStorage] RetrieveBlob: WARNING - failed to cache %s locally (legacy, no SHA)",
+                        filename.c_str());
+                }
+                if (found) *found = true;
+                return data;
+            }
+        }
+
+        // Cloud failed -- fall back to local cache if SHA matches.
+        std::vector<uint8_t> cached;
+        if (TryReadCachedBlob(localPath, filename, cached)) {
+            if (mit != manifest.end() && !mit->second.sha.empty()) {
+                auto cachedSha = FileUtil::SHA1(cached.data(), cached.size());
+                if (cachedSha == mit->second.sha) {
+                    LOG("[CloudStorage] RetrieveBlob: cloud unavailable, cache SHA valid: %s (%zu bytes)",
+                        filename.c_str(), cached.size());
+                    if (found) *found = true;
+                    return cached;
+                }
+                LOG("[CloudStorage] RetrieveBlob: cloud unavailable, cache SHA MISMATCH: %s",
+                    filename.c_str());
+            } else {
+                LOG("[CloudStorage] RetrieveBlob: cloud unavailable, no manifest SHA for %s, serving cached (%zu bytes)",
                     filename.c_str(), cached.size());
                 if (found) *found = true;
                 return cached;
             }
-            LOG("[CloudStorage] RetrieveBlob: cloud error and no local cache: %s", filename.c_str());
         }
         
         LOG("[CloudStorage] RetrieveBlob: not found anywhere: %s", filename.c_str());
@@ -1089,15 +1429,17 @@ std::vector<uint8_t> RetrieveBlob(uint32_t accountId, uint32_t appId,
 }
 
 bool DeleteBlob(uint32_t accountId, uint32_t appId,
-                const std::string& filename,
-                bool keepTombstoneOnSuccess) {
+                const std::string& filename) {
     if (!DeleteBlobStaged(accountId, appId, filename)) return false;
     if (g_provider) {
-        CloudWorkQueue::WorkItem wi;
-        wi.type = CloudWorkQueue::WorkItem::Delete;
-        wi.cloudPath = CloudBlobPath(accountId, appId, filename);
-        wi.suppressTombstoneClear = keepTombstoneOnSuccess;
-        CloudWorkQueue::EnqueueWork(std::move(wi));
+        if (appId == CloudIntercept::kAccountScopeAppId) {
+            // Account-scope: filename-addressed, immediate cloud delete.
+            CloudWorkQueue::WorkItem wi;
+            wi.type = CloudWorkQueue::WorkItem::Delete;
+            wi.cloudPath = CloudBlobPath(accountId, appId, filename);
+            CloudWorkQueue::EnqueueWork(std::move(wi));
+        }
+        // CAS: don't delete cloud blobs inline; GC reclaims orphans.
     }
     return true;
 }
@@ -1122,12 +1464,6 @@ bool DeleteBlobStaged(uint32_t accountId, uint32_t appId,
 
     LOG("[CloudStorage] DeleteBlob: removed local cache: %s", filename.c_str());
 
-    // Stamp tombstone BEFORE enqueueing the cloud delete; cleared on success.
-    // CN is captured so a cross-machine re-save with higher CN can override.
-    uint64_t cnAtDelete = LocalStorage::GetChangeNumber(accountId, appId);
-    LocalMetadataStore::MarkDeleted(accountId, appId,
-                              CanonicalizeInternalMetadataName(filename), cnAtDelete);
-
     // CN is incremented once per batch in HandleCompleteBatch, not per file.
 
     return true;
@@ -1149,37 +1485,21 @@ bool PromoteStagedBatchForCommit(uint32_t accountId, uint32_t appId,
         return false;
     }
 
-    if (!g_provider || !g_provider->IsAuthenticated()) return true;
+    if (!g_provider || !g_provider->IsAuthenticated()) {
+        LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: cloud provider unavailable, failing batch",
+            appId, (unsigned long long)batchId);
+        return false;
+    }
 
-    auto PromoteRollback = [&](uint32_t acct, uint32_t app, const std::vector<std::string>& soFar) {
-        size_t failed = 0;
-        for (const auto& f : soFar) {
-            if (!g_provider->Remove(CloudBlobPath(acct, app, f))) {
-                LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: rollback Remove failed for %s",
-                    app, (unsigned long long)batchId, f.c_str());
-                ++failed;
-            }
-        }
-        if (failed > 0) {
-            LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: CRITICAL - %zu file(s) remain in cloud after failed rollback",
-                app, (unsigned long long)batchId, failed);
-            // These orphaned files will be cleaned up on next sync when manifest repair detects them
-        }
-        LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: rolled back %zu/%zu promoted upload(s)",
-            app, (unsigned long long)batchId, soFar.size() - failed, soFar.size());
-    };
-    std::vector<std::string> promoted;
+    // CAS: no rollback needed -- re-upload is idempotent, GC reclaims orphans.
 
     std::vector<ICloudProvider::UploadItem> batchItems;
     batchItems.reserve(uploads.size());
-    std::vector<std::string> batchFilenames;
-    batchFilenames.reserve(uploads.size());
 
     for (const auto& filename : uploads) {
         if (CloudIntercept::IsReservedBlobFilename(filename)) {
             LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: rejecting reserved /blobs/ filename %s",
                 appId, (unsigned long long)batchId, filename.c_str());
-            PromoteRollback(accountId, appId, promoted);
             return false;
         }
 
@@ -1188,46 +1508,49 @@ bool PromoteStagedBatchForCommit(uint32_t accountId, uint32_t appId,
         if (!TryReadCachedBlob(localPath, filename, data)) {
             LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: cached upload missing for %s",
                 appId, (unsigned long long)batchId, filename.c_str());
-            PromoteRollback(accountId, appId, promoted);
             return false;
         }
 
+        // CAS: upload to blobs/{filename}/{sha}; skip if already exists.
+        auto sha = FileUtil::SHA1(data.data(), data.size());
+        std::string shaHex = ShaToHex(sha);
         ICloudProvider::UploadItem item;
-        item.path = CloudBlobPath(accountId, appId, filename);
+        item.path = CloudBlobPathByNameAndSHA(accountId, appId, filename, shaHex);
         item.data = std::move(data);
         batchItems.push_back(std::move(item));
-        batchFilenames.push_back(filename);
     }
 
     if (!batchItems.empty()) {
-        if (!g_provider->UploadBatch(batchItems)) {
-            LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: batch upload failed",
-                appId, (unsigned long long)batchId);
-            PromoteRollback(accountId, appId, promoted);
-            return false;
+        // Filter out blobs that already exist on cloud (CAS dedup).
+        std::vector<ICloudProvider::UploadItem> newItems;
+        newItems.reserve(batchItems.size());
+        for (auto& item : batchItems) {
+            if (g_provider->CheckExists(item.path) == ICloudProvider::ExistsStatus::Exists) {
+                LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: CAS dedup skipped %s",
+                    appId, (unsigned long long)batchId, item.path.c_str());
+                continue;
+            }
+            newItems.push_back(std::move(item));
         }
-        for (const auto& filename : batchFilenames) {
-            promoted.push_back(filename);
+
+        if (!newItems.empty()) {
+            if (!g_provider->UploadBatch(newItems)) {
+                LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: batch upload failed",
+                    appId, (unsigned long long)batchId);
+                return false;
+            }
         }
     }
 
-    for (const auto& filename : deletes) {
-        std::string livePath = CloudBlobPath(accountId, appId, filename);
-        if (!g_provider->Remove(livePath)) {
-            LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: live delete failed for %s",
-                appId, (unsigned long long)batchId, filename.c_str());
-            PromoteRollback(accountId, appId, promoted);
-            return false;
-        }
-    }
-
-    for (const auto& filename : uploads) {
-        LocalMetadataStore::ClearDeleted(accountId, appId,
-                                   CanonicalizeInternalMetadataName(filename));
+    // CAS: deletes don't remove cloud blobs; GC reclaims orphans.
+    if (!deletes.empty()) {
+        LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: %zu delete(s) deferred to GC",
+            appId, (unsigned long long)batchId, deletes.size());
     }
 
     LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: promoted %zu upload(s), %zu delete(s)",
         appId, (unsigned long long)batchId, uploads.size(), deletes.size());
+    InvalidateBlobIndex(accountId, appId);
     return true;
 }
 
@@ -1306,8 +1629,26 @@ ICloudProvider::ExistsStatus CheckBlobExists(uint32_t accountId, uint32_t appId,
     // Check cloud
     InflightSyncScope guard;
     if (guard && g_provider) {
-        std::string cloudPath = CloudBlobPath(accountId, appId, filename);
-        return g_provider->CheckExists(cloudPath);
+        if (appId == CloudIntercept::kAccountScopeAppId) {
+            // Account-scope: filename-addressed.
+            return g_provider->CheckExists(CloudBlobPath(accountId, appId, filename));
+        }
+        // CAS: resolve filename->SHA, probe canonical/legacy-CAS/legacy-filename.
+        Manifest manifest = LoadLocalManifest(accountId, appId);
+        auto mit = manifest.find(filename);
+        if (mit != manifest.end() && !mit->second.sha.empty()) {
+            std::string shaHex = ShaToHex(mit->second.sha);
+            std::string canonicalPath = CloudBlobPathByNameAndSHA(accountId, appId, filename, shaHex);
+            auto status = g_provider->CheckExists(canonicalPath);
+            if (status == ICloudProvider::ExistsStatus::Exists) return status;
+
+            std::string legacyShaPath = CloudBlobPathBySHA(accountId, appId, shaHex);
+            status = g_provider->CheckExists(legacyShaPath);
+            if (status == ICloudProvider::ExistsStatus::Exists) return status;
+        }
+        // No SHA or probes missed -- try pre-CAS filename path.
+        std::string legacyPath = CloudBlobPath(accountId, appId, filename);
+        return g_provider->CheckExists(legacyPath);
     }
 
     return ICloudProvider::ExistsStatus::Missing;
@@ -1317,27 +1658,40 @@ bool ListRemoteBlobNames(uint32_t accountId, uint32_t appId,
                          std::unordered_set<std::string>& outNames) {
     outNames.clear();
 
-    InflightSyncScope guard;
-    if (!guard) return false;
-    if (!g_provider || !g_provider->IsAuthenticated()) return true;
-
-    std::string blobPrefix = std::to_string(accountId) + "/" +
-                             std::to_string(appId) + "/blobs/";
-    std::vector<ICloudProvider::FileInfo> remoteBlobs;
-    bool complete = false;
-    if (!g_provider->ListChecked(blobPrefix, remoteBlobs, &complete) || !complete) {
-        return false;
+    // CAS: manifest is authoritative for filename->SHA mapping.
+    // Trust manifest (published after blobs uploaded) rather than per-file probes.
+    Manifest manifest = LoadLocalManifest(accountId, appId);
+    for (const auto& [filename, entry] : manifest) {
+        if (CloudIntercept::IsReservedBlobFilename(filename)) continue;
+        if (entry.sha.empty()) continue;
+        outNames.insert(filename);
     }
 
-    for (const auto& fi : remoteBlobs) {
-        uint32_t parsedAccountId = 0;
-        uint32_t parsedAppId = 0;
-        std::string remoteName;
-        if (!ParseCloudBlobPath(fi.path, parsedAccountId, parsedAppId, remoteName)) continue;
-        if (parsedAccountId != accountId || parsedAppId != appId) continue;
-        remoteName = CanonicalizeInternalMetadataName(remoteName);
-        if (CloudIntercept::IsReservedBlobFilename(remoteName)) continue;
-        outNames.insert(std::move(remoteName));
+    // Also check for legacy filename-addressed blobs from pre-CAS layout.
+    InflightSyncScope guard;
+    if (guard && g_provider && g_provider->IsAuthenticated()) {
+        std::string blobPrefix = std::to_string(accountId) + "/" +
+                                 std::to_string(appId) + "/blobs/";
+        std::vector<ICloudProvider::FileInfo> remoteBlobs;
+        bool complete = false;
+        if (g_provider->ListChecked(blobPrefix, remoteBlobs, &complete) && complete) {
+            for (const auto& fi : remoteBlobs) {
+                uint32_t parsedAccountId = 0;
+                uint32_t parsedAppId = 0;
+                std::string remoteName;
+                if (!ParseCloudBlobPath(fi.path, parsedAccountId, parsedAppId, remoteName)) continue;
+                if (parsedAccountId != accountId || parsedAppId != appId) continue;
+                // Legacy blobs have filename-like names (contain '/' or '.').
+                // CAS blobs are pure 40-char hex. Skip CAS SHA names.
+                if (remoteName.size() == 40 &&
+                    remoteName.find_first_not_of("0123456789abcdef") == std::string::npos) {
+                    continue; // SHA-addressed blob, already covered by manifest
+                }
+                remoteName = CanonicalizeInternalMetadataName(remoteName);
+                if (CloudIntercept::IsReservedBlobFilename(remoteName)) continue;
+                outNames.insert(std::move(remoteName));
+            }
+        }
     }
 
     return true;
@@ -1353,6 +1707,176 @@ bool HasLocalBlob(uint32_t accountId, uint32_t appId, const std::string& filenam
     return !statEc && std::filesystem::is_regular_file(st);
 }
 
+
+// GC: delete unreferenced blobs. Keeps manifest-referenced canonical and
+// legacy-SHA blobs; deletes everything else. Requires complete listing.
+// Returns count deleted, or -1 on error.
+int GarbageCollectBlobs(uint32_t accountId, uint32_t appId) {
+    if (appId == CloudIntercept::kAccountScopeAppId) {
+        LOG("[GC] Skipping GC for account-scope (appId=0) -- filename-addressed");
+        return 0;
+    }
+
+    InflightSyncScope guard;
+    if (!guard || !g_provider || !g_provider->IsAuthenticated()) {
+        LOG("[GC] app=%u: provider unavailable, skipping", appId);
+        return -1;
+    }
+
+    std::string blobPrefix = std::to_string(accountId) + "/" +
+                             std::to_string(appId) + "/blobs/";
+    std::vector<ICloudProvider::FileInfo> remoteBlobs;
+    bool complete = false;
+    if (!g_provider->ListChecked(blobPrefix, remoteBlobs, &complete) || !complete) {
+        LOG("[GC] app=%u: listing incomplete or failed, refusing GC", appId);
+        return -1;
+    }
+
+    if (remoteBlobs.empty()) {
+        LOG("[GC] app=%u: no cloud blobs, nothing to GC", appId);
+        return 0;
+    }
+
+    // Build the set of paths the manifest expects to find on the provider.
+    Manifest manifest = LoadLocalManifest(accountId, appId);
+    std::unordered_set<std::string> keepCanonicalPaths;
+    std::unordered_set<std::string> keepLegacySHAs;
+    // filename -> (canonical cloud path, expected SHA hex) for promoting legacy blobs
+    struct ManifestRef {
+        std::string canonicalPath;
+        std::string shaHex;
+    };
+    std::unordered_map<std::string, ManifestRef> filenameToManifestRef;
+    for (const auto& [filename, entry] : manifest) {
+        if (entry.sha.empty()) continue;
+        std::string shaHex = ShaToHex(entry.sha);
+        std::string canonPath =
+            CloudBlobPathByNameAndSHA(accountId, appId, filename, shaHex);
+        keepCanonicalPaths.insert(canonPath);
+        keepLegacySHAs.insert(shaHex);
+        filenameToManifestRef[filename] = {canonPath, shaHex};
+    }
+
+    // Collect the set of canonical paths that actually exist on the provider.
+    std::unordered_set<std::string> existingCanonicalPaths;
+
+    auto isHexSha = [](const std::string& s) {
+        return s.size() == 40 &&
+               s.find_first_not_of("0123456789abcdef") == std::string::npos;
+    };
+
+    for (const auto& fi : remoteBlobs) {
+        if (fi.path.size() <= blobPrefix.size()) continue;
+        std::string rel = fi.path.substr(blobPrefix.size());
+        size_t lastSlash = rel.rfind('/');
+        if (lastSlash != std::string::npos) {
+            std::string leaf = rel.substr(lastSlash + 1);
+            if (isHexSha(leaf) && keepCanonicalPaths.count(fi.path)) {
+                existingCanonicalPaths.insert(fi.path);
+            }
+        }
+    }
+
+    std::vector<std::string> orphans;
+    // Legacy blobs whose canonical CAS equivalent is missing -- promote these.
+    struct PromoteEntry {
+        std::string legacyPath;
+        std::string canonicalPath;
+        std::string expectedShaHex;
+    };
+    std::vector<PromoteEntry> promotions;
+
+    for (const auto& fi : remoteBlobs) {
+        if (fi.path.size() <= blobPrefix.size()) continue;
+        std::string rel = fi.path.substr(blobPrefix.size());
+
+        // 1. Canonical path: keep iff (filename, sha) is in manifest.
+        size_t lastSlash = rel.rfind('/');
+        if (lastSlash != std::string::npos) {
+            std::string leaf = rel.substr(lastSlash + 1);
+            if (isHexSha(leaf)) {
+                if (keepCanonicalPaths.count(fi.path) == 0) {
+                    orphans.push_back(fi.path);
+                }
+                continue;
+            }
+        }
+
+        // 2. Legacy CAS: blobs/{sha} -- keep iff sha referenced.
+        if (isHexSha(rel)) {
+            if (keepLegacySHAs.count(rel) == 0) {
+                orphans.push_back(fi.path);
+            }
+            continue;
+        }
+
+        // 3. Pre-CAS filename-only blob.
+        auto it = filenameToManifestRef.find(rel);
+        if (it != filenameToManifestRef.end() &&
+            existingCanonicalPaths.count(it->second.canonicalPath) == 0) {
+            // Manifest references this file but canonical CAS blob is missing.
+            // Promote legacy blob to canonical path instead of deleting.
+            promotions.push_back({fi.path, it->second.canonicalPath, it->second.shaHex});
+        } else {
+            orphans.push_back(fi.path);
+        }
+    }
+
+    // Promote legacy blobs to canonical CAS paths (with SHA verification).
+    int promoted = 0;
+    for (const auto& p : promotions) {
+        std::vector<uint8_t> data;
+        if (!g_provider->Download(p.legacyPath, data)) {
+            LOG("[GC] app=%u: promote failed (download): %s", appId, p.legacyPath.c_str());
+            continue;
+        }
+        // Verify content matches the manifest SHA before promoting.
+        std::string actualSha = ShaToHex(FileUtil::SHA1(data.data(), data.size()));
+        if (actualSha != p.expectedShaHex) {
+            LOG("[GC] app=%u: promote skipped (SHA mismatch): %s actual=%s expected=%s",
+                appId, p.legacyPath.c_str(), actualSha.c_str(), p.expectedShaHex.c_str());
+            // Stale blob -- delete it like a normal orphan.
+            g_provider->Remove(p.legacyPath);
+            continue;
+        }
+        if (!g_provider->Upload(p.canonicalPath, data.data(), data.size())) {
+            LOG("[GC] app=%u: promote failed (upload): %s -> %s",
+                appId, p.legacyPath.c_str(), p.canonicalPath.c_str());
+            continue;
+        }
+        // Legacy copy is now redundant -- delete it.
+        g_provider->Remove(p.legacyPath);
+        ++promoted;
+        LOG("[GC] app=%u: promoted legacy blob: %s -> %s",
+            appId, p.legacyPath.c_str(), p.canonicalPath.c_str());
+    }
+    if (promoted > 0) {
+        LOG("[GC] app=%u: promoted %d/%zu legacy blob(s) to CAS",
+            appId, promoted, promotions.size());
+    }
+
+    if (orphans.empty()) {
+        LOG("[GC] app=%u: all %zu cloud blobs are referenced, nothing to GC",
+            appId, remoteBlobs.size());
+        return promoted;
+    }
+
+    LOG("[GC] app=%u: found %zu orphaned blobs out of %zu total, deleting...",
+        appId, orphans.size(), remoteBlobs.size());
+
+    int deleted = 0;
+    for (const auto& path : orphans) {
+        if (g_provider->Remove(path)) {
+            ++deleted;
+        } else {
+            LOG("[GC] app=%u: failed to delete blob %s", appId, path.c_str());
+        }
+    }
+
+    LOG("[GC] app=%u: deleted %d/%zu orphaned blobs", appId, deleted, orphans.size());
+    InvalidateBlobIndex(accountId, appId);
+    return deleted + promoted;
+}
 
 // Atomic small-text write (.tmp + rename) into local storage.
 static bool WriteLocalText(const std::string& path, const std::string& content) {
@@ -1685,9 +2209,6 @@ static bool SyncFromCloudInner(uint32_t accountId, uint32_t appId, bool isSweep)
     // Distinguishes a verified-complete listing from a truncated one;
     // prune/recovery refuse to run on incomplete listings.
     bool cloudListComplete = false;
-    // Capture timestamp BEFORE the listing so tombstone eviction can protect
-    // any MarkDeleted that fires after the listing snapshot was frozen.
-    uint64_t listingCapturedAtUnix = static_cast<uint64_t>(std::time(nullptr));
     // Suppressed under cloudHadNewerCN so promote/rollback runs to completion.
     if (!cloudHadNewerCN &&
         !SweepShouldYield(isSweep, "SyncFromCloud (pre-list)")) return false;
@@ -1752,55 +2273,58 @@ static bool SyncFromCloudInner(uint32_t accountId, uint32_t appId, bool isSweep)
         }
     }
 
-    std::unordered_set<std::string> cloudBlobNames;
+    // Build name sets from cloud listing and manifest.
+    std::unordered_set<std::string> cloudBlobSHAs;  // SHA hex strings on cloud
+    std::unordered_set<std::string> cloudBlobNames;  // filenames covered by manifest
+    bool cloudListingHasBlobs = false;  // true if cloud has ANY blob (CAS or legacy)
     for (auto& fi : cloudBlobs) {
         auto blobsPos = fi.path.find("/blobs/");
         if (blobsPos == std::string::npos) continue;
-        std::string filename = fi.path.substr(blobsPos + 7);
-        std::string canonicalName = CanonicalizeInternalMetadataName(filename);
-        if (CloudIntercept::IsReservedBlobFilename(canonicalName)) continue;
-        cloudBlobNames.insert(canonicalName);
+        std::string leaf = fi.path.substr(blobsPos + 7);
+        cloudListingHasBlobs = true;
+        // CAS blobs are pure 40-char hex; legacy blobs contain '/' or '.'.
+        if (leaf.size() == 40 &&
+            leaf.find_first_not_of("0123456789abcdef") == std::string::npos) {
+            cloudBlobSHAs.insert(leaf);
+        } else {
+            std::string canonicalName = CanonicalizeInternalMetadataName(leaf);
+            if (CloudIntercept::IsReservedBlobFilename(canonicalName)) continue;
+            cloudBlobNames.insert(canonicalName);
+        }
+    }
+    // The manifest-referenced filenames are considered present in cloud.
+    Manifest syncManifest = LoadLocalManifest(accountId, appId);
+    for (const auto& [fn, entry] : syncManifest) {
+        if (entry.sha.empty()) continue;
+        if (CloudIntercept::IsReservedBlobFilename(fn)) continue;
+        cloudBlobNames.insert(fn);
     }
 
     if (cloudListSucceeded && cloudListComplete) {
-        std::vector<ICloudProvider::FileInfo> filteredCloudBlobs;
-        filteredCloudBlobs.reserve(cloudBlobs.size());
-        std::unordered_set<std::string> filteredCloudBlobNames;
+        // Clean up internal/reserved blobs from the cloud listing.
         for (const auto& fi : cloudBlobs) {
             auto blobsPos = fi.path.find("/blobs/");
             if (blobsPos == std::string::npos) continue;
-            std::string filename = fi.path.substr(blobsPos + 7);
-            std::string canonicalName = CanonicalizeInternalMetadataName(filename);
-            if (CloudIntercept::IsReservedBlobFilename(canonicalName)) {
-                CleanupInternalBlobEntry(accountId, appId, fi, filename);
+            std::string leaf = fi.path.substr(blobsPos + 7);
+            // Skip CAS SHA blobs.
+            if (leaf.size() == 40 &&
+                leaf.find_first_not_of("0123456789abcdef") == std::string::npos) {
                 continue;
             }
-            filteredCloudBlobNames.insert(canonicalName);
-            filteredCloudBlobs.push_back(fi);
+            std::string canonicalName = CanonicalizeInternalMetadataName(leaf);
+            if (CloudIntercept::IsReservedBlobFilename(canonicalName)) {
+                CleanupInternalBlobEntry(accountId, appId, fi, leaf);
+            }
         }
-        cloudBlobs = std::move(filteredCloudBlobs);
-        cloudBlobNames = std::move(filteredCloudBlobNames);
     }
 
     // Cloud-side legacy-blob cleanup. Requires a complete listing so the
-    // classifier can confirm the canonical sibling exists. Filters legacy
-    // paths out of cloudBlobs before the download loop so the concurrent
-    // delete worker can't race a 404 into the failed counter.
+    // classifier can confirm the canonical sibling exists.
     if (cloudListSucceeded && cloudListComplete) {
         std::vector<std::string> rawPaths;
         rawPaths.reserve(cloudBlobs.size());
         for (auto& fi : cloudBlobs) rawPaths.push_back(fi.path);
         auto legacyToDelete = LegacyMetadataCleanup::ClassifyLegacyCloudBlobsToDelete(rawPaths);
-
-        std::unordered_set<std::string> legacyPathSet(legacyToDelete.begin(), legacyToDelete.end());
-        if (!legacyPathSet.empty()) {
-            cloudBlobs.erase(
-                std::remove_if(cloudBlobs.begin(), cloudBlobs.end(),
-                    [&](const ICloudProvider::FileInfo& fi) {
-                        return legacyPathSet.count(fi.path) > 0;
-                    }),
-                cloudBlobs.end());
-        }
 
         for (auto& legacyPath : legacyToDelete) {
             LOG("[CloudStorage] SyncFromCloud app %u: enqueueing delete of legacy cloud blob %s",
@@ -1808,27 +2332,11 @@ static bool SyncFromCloudInner(uint32_t accountId, uint32_t appId, bool isSweep)
             CloudWorkQueue::WorkItem wi;
             wi.type = CloudWorkQueue::WorkItem::Delete;
             wi.cloudPath = std::move(legacyPath);
-            wi.suppressTombstoneClear = true;
             CloudWorkQueue::EnqueueWork(std::move(wi));
         }
     }
 
-    // Tombstones hold until cloud CN advances AND blob mtime is newer (skew grace). MigrateDeletedKeys canonicalizes legacy keys under g_mutex.
-    std::unordered_map<std::string, LocalMetadataStore::TombstoneInfo> deletedTombstones;
-    {
-        size_t migratedCount = 0;
-        LocalMetadataStore::MigrateDeletedKeys(
-            accountId, appId,
-            [](const std::string& k) {
-                return CanonicalizeInternalMetadataName(k);
-            },
-            deletedTombstones, migratedCount);
-        if (migratedCount > 0) {
-            LOG("[CloudStorage] SyncFromCloud app %u: canonicalized %zu legacy tombstone key(s)",
-                appId, migratedCount);
-        }
-    }
-
+    // Download: manifest-driven (CAS) or listing-driven (legacy).
     {
         struct StagedBlob {
             std::string filename;
@@ -1837,72 +2345,63 @@ static bool SyncFromCloudInner(uint32_t accountId, uint32_t appId, bool isSweep)
         std::vector<StagedBlob> stagedNewerBlobs;
         int downloaded = 0, skipped = 0, failed = 0;
         bool timedOut = false;
+
+        // Work list: manifest entries (CAS) or cloud listing (legacy).
+        struct DownloadItem {
+            std::string filename;
+            std::string cloudPath;
+        };
+        std::vector<DownloadItem> downloadItems;
+        if (!syncManifest.empty()) {
+            // CAS: download by canonical filename/{sha}; RetrieveBlob handles legacy fallback.
+            for (const auto& [filename, entry] : syncManifest) {
+                if (entry.sha.empty()) continue;
+                if (CloudIntercept::IsReservedBlobFilename(filename)) continue;
+                std::string shaHex = ShaToHex(entry.sha);
+                downloadItems.push_back({
+                    filename,
+                    CloudBlobPathByNameAndSHA(accountId, appId, filename, shaHex)
+                });
+            }
+        } else {
+            // Legacy: listing-driven, filename-addressed blobs.
+            for (auto& fi : cloudBlobs) {
+                auto blobsPos = fi.path.find("/blobs/");
+                if (blobsPos == std::string::npos) continue;
+                std::string leaf = fi.path.substr(blobsPos + 7);
+                // Skip CAS SHA blobs (no manifest to resolve them).
+                if (leaf.size() == 40 &&
+                    leaf.find_first_not_of("0123456789abcdef") == std::string::npos) {
+                    continue;
+                }
+                std::string filename = CanonicalizeInternalMetadataName(leaf);
+                if (CloudIntercept::IsReservedBlobFilename(filename)) continue;
+                downloadItems.push_back({ filename, fi.path });
+            }
+        }
+
         auto blobStart = std::chrono::steady_clock::now();
-        for (auto& fi : cloudBlobs) {
+        for (auto& item : downloadItems) {
             // Check timeout
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now() - blobStart).count();
             if (elapsed >= BLOB_SYNC_TIMEOUT_SEC) {
-                int remaining = (int)cloudBlobs.size() - downloaded - skipped;
+                int remaining = (int)downloadItems.size() - downloaded - skipped;
                 LOG("[CloudStorage] SyncFromCloud app %u: blob download TIMEOUT after %llds, "
                     "%d downloaded, %d skipped, ~%d remaining",
                     appId, (long long)elapsed, downloaded, skipped, remaining);
                 timedOut = true;
                 break;
             }
-            // Yielding mid-loop reuses the timeout exit so any newer-cloud-CN
-            // promotion (gated on failed==0 && !timedOut) defers to the next sync.
             if (isSweep && g_foregroundSyncCount.load(std::memory_order_seq_cst) > 0) {
-                int remaining = (int)cloudBlobs.size() - downloaded - skipped;
+                int remaining = (int)downloadItems.size() - downloaded - skipped;
                 LOG("[CloudStorage] SyncFromCloud app %u: sweep yielding blob loop to foreground sync (downloaded=%d skipped=%d remaining=%d)",
                     appId, downloaded, skipped, remaining);
                 timedOut = true;
                 break;
             }
 
-            // fi.path: "{accountId}/{appId}/blobs/{filename}"
-            auto blobsPos = fi.path.find("/blobs/");
-            if (blobsPos == std::string::npos) continue;
-            std::string filename = CanonicalizeInternalMetadataName(fi.path.substr(blobsPos + 7));
-
-            // Override: cloud CN advance AND blob mtime > tombstone (5-min skew grace); missing mtime -> CN-only.
-            auto tombIt = deletedTombstones.find(filename);
-            if (tombIt != deletedTombstones.end()) {
-                constexpr uint64_t kTombstoneSkewSec = 300;
-                bool cnAdvanced = cloudCNFound && cloudCN > tombIt->second.cn;
-                bool haveBlobTime = tombIt->second.createTimeUnix > 0 && fi.modifiedTime > 0;
-                bool blobNewerThanTombstone = haveBlobTime &&
-                    fi.modifiedTime > tombIt->second.createTimeUnix + kTombstoneSkewSec;
-                bool overrideTomb = false;
-                if (cnAdvanced) {
-                    overrideTomb = haveBlobTime ? blobNewerThanTombstone : true;
-                }
-                if (overrideTomb) {
-                    LOG("[CloudStorage] SyncFromCloud app %u: tombstone for %s overridden "
-                        "(cloudCn=%llu > tombCn=%llu, blobMtime=%llu > tombCreate=%llu) -- clearing and downloading",
-                        appId, filename.c_str(),
-                        (unsigned long long)cloudCN,
-                        (unsigned long long)tombIt->second.cn,
-                        (unsigned long long)fi.modifiedTime,
-                        (unsigned long long)tombIt->second.createTimeUnix);
-                    LocalMetadataStore::ClearDeleted(accountId, appId, filename);
-                    deletedTombstones.erase(tombIt);
-                    // fall through to normal download path
-                } else {
-                    skipped++;
-                    LOG("[CloudStorage] SyncFromCloud app %u: skipping tombstoned blob %s "
-                        "(tombCn=%llu tombCreate=%llu cloudCn=%llu blobMtime=%llu cnAdvanced=%d blobNewer=%d)",
-                        appId, filename.c_str(),
-                        (unsigned long long)tombIt->second.cn,
-                        (unsigned long long)tombIt->second.createTimeUnix,
-                        (unsigned long long)cloudCN,
-                        (unsigned long long)fi.modifiedTime,
-                        cnAdvanced ? 1 : 0, blobNewerThanTombstone ? 1 : 0);
-                    continue;
-                }
-            }
-
-            std::string localBlobFile = LocalBlobPath(accountId, appId, filename);
+            std::string localBlobFile = LocalBlobPath(accountId, appId, item.filename);
             std::error_code existsEc;
             bool localExists = std::filesystem::exists(FileUtil::Utf8ToPath(localBlobFile), existsEc);
             if (existsEc) localExists = false;
@@ -1911,33 +2410,72 @@ static bool SyncFromCloudInner(uint32_t accountId, uint32_t appId, bool isSweep)
                 continue; // already cached
             }
 
-            // Download to local cache (atomic write)
-            LOG("[CloudStorage] SyncFromCloud app %u: downloading blob %s...", appId, filename.c_str());
+            LOG("[CloudStorage] SyncFromCloud app %u: downloading blob %s...", appId, item.filename.c_str());
             std::vector<uint8_t> data;
-            if (g_provider->Download(fi.path, data)) {
+            if (g_provider->Download(item.cloudPath, data)) {
                 if (cloudHadNewerCN) {
-                    stagedNewerBlobs.push_back({ filename, std::move(data) });
+                    stagedNewerBlobs.push_back({ item.filename, std::move(data) });
                     downloaded++;
                     continue;
                 }
 
-                // CN was already advanced in step 1; per-file write doesn't increment.
                 const uint8_t* writeData = data.empty() ? nullptr : data.data();
-                if (LocalStorage::WriteFileNoIncrement(accountId, appId, filename,
+                if (LocalStorage::WriteFileNoIncrement(accountId, appId, item.filename,
                                                        writeData, data.size())) {
                     downloaded++;
                     LOG("[CloudStorage] SyncFromCloud app %u: blob %s downloaded (%zu bytes)",
-                        appId, filename.c_str(), data.size());
+                        appId, item.filename.c_str(), data.size());
                 } else {
                     failed++;
                     LOG("[CloudStorage] SyncFromCloud app %u: failed to write blob %s",
-                        appId, filename.c_str());
+                        appId, item.filename.c_str());
                     continue;
+                }
+            } else if (!syncManifest.empty()) {
+                // Canonical failed -- cascade: legacy CAS, then pre-CAS filename.
+                auto mit = syncManifest.find(item.filename);
+                std::string fallbackPath;
+                if (mit != syncManifest.end() && !mit->second.sha.empty()) {
+                    fallbackPath = CloudBlobPathBySHA(accountId, appId,
+                                                     ShaToHex(mit->second.sha));
+                }
+                bool fellBack = false;
+                if (!fallbackPath.empty() && g_provider->Download(fallbackPath, data)) {
+                    fellBack = true;
+                    LOG("[CloudStorage] SyncFromCloud app %u: blob %s downloaded from legacy CAS path (%zu bytes)",
+                        appId, item.filename.c_str(), data.size());
+                } else {
+                    std::string legacyPath = CloudBlobPath(accountId, appId, item.filename);
+                    if (g_provider->Download(legacyPath, data)) {
+                        fellBack = true;
+                        LOG("[CloudStorage] SyncFromCloud app %u: blob %s downloaded from legacy filename path (%zu bytes)",
+                            appId, item.filename.c_str(), data.size());
+                    }
+                }
+                if (fellBack) {
+                    if (cloudHadNewerCN) {
+                        stagedNewerBlobs.push_back({ item.filename, std::move(data) });
+                        downloaded++;
+                        continue;
+                    }
+                    const uint8_t* writeData = data.empty() ? nullptr : data.data();
+                    if (LocalStorage::WriteFileNoIncrement(accountId, appId, item.filename,
+                                                           writeData, data.size())) {
+                        downloaded++;
+                    } else {
+                        failed++;
+                        LOG("[CloudStorage] SyncFromCloud app %u: failed to write blob %s (legacy fallback)",
+                            appId, item.filename.c_str());
+                    }
+                } else {
+                    failed++;
+                    LOG("[CloudStorage] SyncFromCloud app %u: FAILED to download blob %s",
+                        appId, item.filename.c_str());
                 }
             } else {
                 failed++;
                 LOG("[CloudStorage] SyncFromCloud app %u: FAILED to download blob %s",
-                    appId, filename.c_str());
+                    appId, item.filename.c_str());
             }
         }
 
@@ -2022,16 +2560,10 @@ static bool SyncFromCloudInner(uint32_t accountId, uint32_t appId, bool isSweep)
         }
     }
 
-    // Evict tombstones for names absent from the (complete) cloud listing.
-    if (cloudListSucceeded && cloudListComplete) {
-        LocalMetadataStore::EvictTombstonesNotIn(accountId, appId, cloudBlobNames,
-                                           listingCapturedAtUnix);
-    }
-
     // Gap-repair from local cache; verified-complete listing only (an incomplete sub-tree looks identical to empty).
     bool providerLooksUninitialized = cloudListSucceeded && cloudListComplete &&
                                       !cloudCNFound && !cloudRootTokensFound &&
-                                      !cloudFileTokensFound && cloudBlobNames.empty();
+                                      !cloudFileTokensFound && !cloudListingHasBlobs;
     bool canRepairProviderGaps = cloudListSucceeded && cloudListComplete &&
                                  localCN > 0 && providerLooksUninitialized;
     if (canRepairProviderGaps) {
@@ -2078,9 +2610,12 @@ static bool SyncFromCloudInner(uint32_t accountId, uint32_t appId, bool isSweep)
                     if (!f) continue;
                     std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)),
                                               std::istreambuf_iterator<char>());
+                    // CAS: upload to blobs/{filename}/{sha}.
+                    auto sha = FileUtil::SHA1(data.data(), data.size());
+                    std::string shaHex = ShaToHex(sha);
                     CloudWorkQueue::WorkItem wi;
                     wi.type = CloudWorkQueue::WorkItem::Upload;
-                    wi.cloudPath = CloudBlobPath(accountId, appId, rel);
+                    wi.cloudPath = CloudBlobPathByNameAndSHA(accountId, appId, rel, shaHex);
                     wi.data = std::move(data);
                     wi.skipIfExists = true;
                     wi.bestEffort = true;
@@ -2170,40 +2705,23 @@ static bool SyncFromCloudWithFlag(uint32_t accountId, uint32_t appId, bool isSwe
     if (g_shuttingDown.load(std::memory_order_seq_cst)) return false;
     bool hadNewer = SyncFromCloudInner(accountId, appId, isSweep);
     
-    // When cloud had newer data, fetch cloud manifest to preserve correct timestamps.
-    // Don't rebuild from local blobs - that would lose original file timestamps since
-    // WriteFileNoIncrement sets mtime to current time.
     if (hadNewer && !g_shuttingDown.load(std::memory_order_seq_cst)) {
-        Manifest cloudManifest = FetchCloudManifest(accountId, appId);
-        if (!cloudManifest.empty()) {
-            // Cross-check: don't overwrite a richer local manifest with a
-            // suspiciously incomplete cloud manifest (same guard as HandleGetChangelist).
-            Manifest localManifest = LoadLocalManifest(accountId, appId);
-            if (!localManifest.empty() && cloudManifest.size() < localManifest.size()) {
-                LOG("[CloudStorage] SyncFromCloud app %u: cloud manifest (%zu files) "
-                    "smaller than local (%zu files), keeping local",
-                    appId, cloudManifest.size(), localManifest.size());
-            } else {
-                // Cloud manifest is authoritative after a cloud-newer sync.
-                // Start from cloud, then add local-only entries that still
-                // have blobs in the cache (not yet uploaded to this provider).
-                Manifest merged = cloudManifest;
-                for (const auto& [name, entry] : localManifest) {
-                    if (merged.find(name) == merged.end() &&
-                        HasLocalBlob(accountId, appId, name)) {
-                        merged[name] = entry;
-                    }
-                }
-                SaveManifestLocal(accountId, appId, merged);
-                LOG("[CloudStorage] SyncFromCloud app %u: merged manifest with %zu files (cloud=%zu, local-only=%zu)",
-                    appId, merged.size(), cloudManifest.size(), merged.size() - cloudManifest.size());
+        auto stateResult = FetchCloudState(accountId, appId);
+        if (stateResult.status == StateFetchStatus::Ok && !stateResult.state.files.empty()) {
+            Manifest cloudManifest;
+            for (const auto& [name, fe] : stateResult.state.files) {
+                ManifestEntry me;
+                me.sha = fe.sha;
+                me.timestamp = fe.timestamp;
+                me.size = fe.size;
+                cloudManifest[name] = std::move(me);
             }
+            SaveManifestLocal(accountId, appId, cloudManifest);
+            LOG("[CloudStorage] SyncFromCloud app %u: applied cloud state with %zu files",
+                appId, cloudManifest.size());
         } else {
-            // Fallback: build from local blobs if cloud manifest unavailable
-            auto manifest = BuildManifestFromLocalBlobs(accountId, appId);
-            if (!manifest.empty()) {
-                SaveManifest(accountId, appId, manifest);
-            }
+            LOG("[CloudStorage] SyncFromCloud app %u: cloud state unavailable (status=%d), keeping local manifest",
+                appId, (int)stateResult.status);
         }
     }
     

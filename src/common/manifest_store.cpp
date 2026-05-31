@@ -61,6 +61,35 @@ static Manifest PruneManifestToRemoteBlobListing(
 static ICloudProvider*                     g_manifestProvider = nullptr;
 static std::string                        g_manifestLocalRoot;
 
+// --- in-memory manifest cache (avoids repeated disk reads during download bursts) ---
+struct CachedManifest {
+    Manifest manifest;
+    bool valid = false;
+};
+static std::mutex g_manifestCacheMutex;
+static std::unordered_map<uint64_t, CachedManifest> g_manifestCache;
+
+static uint64_t ManifestCacheKey(uint32_t accountId, uint32_t appId) {
+    return (static_cast<uint64_t>(accountId) << 32) | appId;
+}
+
+static bool TryGetCachedManifest(uint32_t accountId, uint32_t appId, Manifest& out) {
+    std::lock_guard<std::mutex> lock(g_manifestCacheMutex);
+    auto it = g_manifestCache.find(ManifestCacheKey(accountId, appId));
+    if (it != g_manifestCache.end() && it->second.valid) {
+        out = it->second.manifest;
+        return true;
+    }
+    return false;
+}
+
+static void SetCachedManifest(uint32_t accountId, uint32_t appId, const Manifest& manifest) {
+    std::lock_guard<std::mutex> lock(g_manifestCacheMutex);
+    auto& entry = g_manifestCache[ManifestCacheKey(accountId, appId)];
+    entry.manifest = manifest;
+    entry.valid = true;
+}
+
 // --- local helpers ---
 
 static std::string ManifestLocalPath(uint32_t accountId, uint32_t appId) {
@@ -174,6 +203,7 @@ static bool SaveManifestImpl(uint32_t accountId, uint32_t appId,
         LOG("[ManifestStore] %s app %u: failed to write local manifest", opName, appId);
         return false;
     }
+    SetCachedManifest(accountId, appId, cleanedManifest);
 
     if (g_manifestProvider && g_manifestProvider->IsAuthenticated()) {
         if (uploadMode == ManifestUploadMode::Sync) {
@@ -207,27 +237,40 @@ static bool SaveManifestImpl(uint32_t accountId, uint32_t appId,
 void ManifestStore_Init(const std::string& localRoot, ICloudProvider* provider) {
     g_manifestLocalRoot = localRoot;
     g_manifestProvider = provider;
+    {
+        std::lock_guard<std::mutex> lock(g_manifestCacheMutex);
+        g_manifestCache.clear();
+    }
     LOG("[ManifestStore] Initialized at %s", localRoot.c_str());
 }
 
-Manifest FetchCloudManifest(uint32_t accountId, uint32_t appId) {
+ManifestFetchResult FetchCloudManifest(uint32_t accountId, uint32_t appId) {
     InflightSyncScope guard;
-    if (!guard) return {};
-    if (!g_manifestProvider || !g_manifestProvider->IsAuthenticated()) return {};
+    if (!guard) return { ManifestFetchStatus::FetchFailed, {} };
+    if (!g_manifestProvider || !g_manifestProvider->IsAuthenticated())
+        return { ManifestFetchStatus::FetchFailed, {} };
 
     std::vector<uint8_t> data;
     bool usedLegacy = false;
     if (!DownloadCloudMetadataWithLegacyFallback(accountId, appId,
             kManifestFilename, kLegacyManifestFilename, data, &usedLegacy)) {
-        LOG("[ManifestStore] FetchCloudManifest app %u: manifest not found or download failed", appId);
-        return {};
+        // Distinguish "file doesn't exist" from "network/download error" so callers
+        // can handle the migration case (CN exists but manifest was never published).
+        auto canonicalPath = CloudMetadataPath(accountId, appId, kManifestFilename);
+        auto existsStatus = g_manifestProvider->CheckExists(canonicalPath);
+        if (existsStatus == ICloudProvider::ExistsStatus::Missing) {
+            LOG("[ManifestStore] FetchCloudManifest app %u: manifest does not exist on provider", appId);
+            return { ManifestFetchStatus::NotFound, {} };
+        }
+        LOG("[ManifestStore] FetchCloudManifest app %u: manifest download failed", appId);
+        return { ManifestFetchStatus::FetchFailed, {} };
     }
 
     constexpr size_t MAX_MANIFEST_SIZE = 16 * 1024 * 1024;
     if (data.size() > MAX_MANIFEST_SIZE) {
         LOG("[ManifestStore] FetchCloudManifest app %u: manifest too large (%zu bytes), rejecting",
             appId, data.size());
-        return {};
+        return { ManifestFetchStatus::ParseFailed, {} };
     }
 
     std::string json(data.begin(), data.end());
@@ -251,10 +294,16 @@ Manifest FetchCloudManifest(uint32_t accountId, uint32_t appId) {
     RemoveLegacyCloudMetadataIfCanonicalExists(accountId, appId,
                                               kFileTokensFilename, kLegacyFileTokensFilename);
 
+    if (root.type != Json::Type::Object) {
+        LOG("[ManifestStore] FetchCloudManifest app %u: manifest blob is not valid JSON object (type=%d, len=%zu)",
+            appId, (int)root.type, json.size());
+        return { ManifestFetchStatus::ParseFailed, {} };
+    }
+
     auto manifest = ParseManifestJson(json);
     LOG("[ManifestStore] FetchCloudManifest app %u: loaded %zu files from cloud manifest",
         appId, manifest.size());
-    return manifest;
+    return { ManifestFetchStatus::Ok, std::move(manifest) };
 }
 
 bool SaveManifest(uint32_t accountId, uint32_t appId, const Manifest& manifest) {
@@ -298,36 +347,8 @@ bool PublishManifestDeltaForCommit(uint32_t accountId, uint32_t appId,
 
     Manifest manifest;
     if (!TryLoadLocalManifest(accountId, appId, manifest)) {
-        LOG("[ManifestStore] PublishManifestDeltaForCommit app %u: local manifest missing; "
-            "falling back to full publish", appId);
+        LOG("[ManifestStore] PublishManifestDeltaForCommit app %u: no local manifest, rebuilding from local blobs", appId);
         manifest = BuildManifestFromLocalBlobs(accountId, appId);
-        if (!SaveManifestImpl(accountId, appId, manifest, ManifestUploadMode::Sync)) {
-            LOG("[ManifestStore] PublishManifestDeltaForCommit app %u: fallback publish failed", appId);
-            return false;
-        }
-        LOG("[ManifestStore] PublishManifestDeltaForCommit app %u: published fallback with %zu files",
-            appId, manifest.size());
-        return true;
-    }
-
-    auto repairStatus = RepairCloudManifest(accountId, appId, manifest,
-                                            /*pruneAbsentRemote=*/false,
-                                            /*persistRepair=*/false);
-    if (repairStatus == ManifestRepairStatus::Incomplete) {
-        LOG("[ManifestStore] PublishManifestDeltaForCommit app %u: repair incomplete; "
-            "falling back to full publish", appId);
-        manifest = BuildManifestFromLocalBlobs(accountId, appId);
-        if (!SaveManifestImpl(accountId, appId, manifest, ManifestUploadMode::Sync)) {
-            LOG("[ManifestStore] PublishManifestDeltaForCommit app %u: fallback publish failed", appId);
-            return false;
-        }
-        LOG("[ManifestStore] PublishManifestDeltaForCommit app %u: published fallback with %zu files",
-            appId, manifest.size());
-        return true;
-    }
-    if (repairStatus == ManifestRepairStatus::Repaired) {
-        LOG("[ManifestStore] PublishManifestDeltaForCommit app %u: repaired; persisting locally", appId);
-        (void)SaveManifestLocal(accountId, appId, manifest);
     }
 
     for (const auto& filename : deletes)  manifest.erase(filename);
@@ -369,6 +390,9 @@ Manifest LoadLocalManifest(uint32_t accountId, uint32_t appId) {
 }
 
 bool TryLoadLocalManifest(uint32_t accountId, uint32_t appId, Manifest& outManifest) {
+    // Check in-memory cache first.
+    if (TryGetCachedManifest(accountId, appId, outManifest)) return true;
+
     outManifest.clear();
     std::string localPath = ManifestLocalPath(accountId, appId);
     std::ifstream in(FileUtil::Utf8ToPath(localPath), std::ios::binary);
@@ -389,8 +413,19 @@ bool TryLoadLocalManifest(uint32_t accountId, uint32_t appId, Manifest& outManif
     in.close();
 
     outManifest = ParseManifestJson(json);
+    SetCachedManifest(accountId, appId, outManifest);
     LOG("[ManifestStore] LoadLocalManifest app %u: loaded %zu files", appId, outManifest.size());
     return true;
+}
+
+// Strip CAS SHA leaf: "subdir/file.sav/a1b2c3..." -> "subdir/file.sav"
+static std::string StripCasShaLeaf(const std::string& name) {
+    size_t lastSlash = name.rfind('/');
+    if (lastSlash == std::string::npos || lastSlash == 0) return name;
+    std::string leaf = name.substr(lastSlash + 1);
+    if (leaf.size() == 40 && leaf.find_first_not_of("0123456789abcdef") == std::string::npos)
+        return name.substr(0, lastSlash);
+    return name;
 }
 
 Manifest BuildManifestFromLocalBlobs(uint32_t accountId, uint32_t appId) {
@@ -398,11 +433,15 @@ Manifest BuildManifestFromLocalBlobs(uint32_t accountId, uint32_t appId) {
     auto files = LocalStorage::GetFileList(accountId, appId);
     for (const auto& fe : files) {
         if (CloudIntercept::IsReservedBlobFilename(fe.filename)) continue;
+        std::string key = StripCasShaLeaf(fe.filename);
         ManifestEntry entry;
         entry.sha = fe.sha;
         entry.timestamp = fe.timestamp;
         entry.size = fe.rawSize;
-        manifest[fe.filename] = std::move(entry);
+        // CAS dedup: if multiple SHAs exist for same file, keep largest (latest upload).
+        auto it = manifest.find(key);
+        if (it != manifest.end() && it->second.size >= entry.size) continue;
+        manifest[key] = std::move(entry);
     }
     LOG("[ManifestStore] BuildManifestFromLocalBlobs app %u: built with %zu files",
         appId, manifest.size());
@@ -429,15 +468,35 @@ ManifestRepairStatus RepairCloudManifest(uint32_t accountId, uint32_t appId,
 
     std::unordered_set<std::string> remoteBlobNames;
     std::unordered_map<std::string, ICloudProvider::FileInfo> remoteBlobInfo;
+    // CAS: remote blobs are SHA-addressed. Build a set of SHA hex strings
+    // present on cloud, then derive filenames from the manifest.
+    std::unordered_set<std::string> remoteBlobSHAs;
     for (const auto& fi : remoteBlobs) {
         uint32_t parsedAccountId = 0, parsedAppId = 0;
-        std::string filename;
-        if (!ParseCloudBlobPath(fi.path, parsedAccountId, parsedAppId, filename)) continue;
+        std::string leaf;
+        if (!ParseCloudBlobPath(fi.path, parsedAccountId, parsedAppId, leaf)) continue;
         if (parsedAccountId != accountId || parsedAppId != appId) continue;
-        filename = CanonicalizeInternalMetadataName(filename);
+        // CAS blobs are pure 40-char hex.
+        if (leaf.size() == 40 &&
+            leaf.find_first_not_of("0123456789abcdef") == std::string::npos) {
+            remoteBlobSHAs.insert(leaf);
+        } else {
+            // Legacy filename-addressed blob.
+            std::string filename = CanonicalizeInternalMetadataName(leaf);
+            if (CloudIntercept::IsReservedBlobFilename(filename)) continue;
+            remoteBlobNames.insert(filename);
+            remoteBlobInfo[filename] = fi;
+        }
+    }
+    // A manifest entry whose SHA blob exists on cloud is considered present.
+    for (const auto& [filename, entry] : manifest) {
+        if (entry.sha.empty()) continue;
         if (CloudIntercept::IsReservedBlobFilename(filename)) continue;
-        remoteBlobNames.insert(filename);
-        remoteBlobInfo[filename] = fi;
+        std::string shaHex = ShaToHex(entry.sha);
+        if (remoteBlobSHAs.count(shaHex)) {
+            remoteBlobNames.insert(filename);
+            // remoteBlobInfo not needed for CAS entries (we download by SHA path)
+        }
     }
 
     size_t repairedCount = 0;
@@ -496,7 +555,7 @@ ManifestRepairStatus RepairCloudManifest(uint32_t accountId, uint32_t appId,
         manifest = std::move(repaired);
         return ManifestRepairStatus::Repaired;
     }
-    if (!SaveManifest(accountId, appId, repaired))
+    if (!SaveManifestLocal(accountId, appId, repaired))
         return ManifestRepairStatus::Incomplete;
     manifest = std::move(repaired);
     return ManifestRepairStatus::Repaired;
@@ -515,12 +574,8 @@ bool UpdateManifestEntry(uint32_t accountId, uint32_t appId,
     auto mtx = AcquireAppSyncMutex(accountId, appId);
     std::lock_guard<std::mutex> lock(*mtx);
 
-    Manifest manifest = LoadLocalManifest(accountId, appId);
-    auto repairStatus = RepairCloudManifest(accountId, appId, manifest);
-    if (repairStatus == ManifestRepairStatus::Incomplete) {
-        manifest = BuildManifestFromLocalBlobs(accountId, appId);
-        if (manifest.empty()) return false;
-    }
+    Manifest manifest;
+    TryLoadLocalManifest(accountId, appId, manifest);
 
     ManifestEntry entry;
     entry.sha = sha;
@@ -528,7 +583,7 @@ bool UpdateManifestEntry(uint32_t accountId, uint32_t appId,
     entry.size = size;
     manifest[filename] = std::move(entry);
 
-    return SaveManifest(accountId, appId, manifest);
+    return SaveManifestLocal(accountId, appId, manifest);
 }
 
 bool RemoveManifestEntry(uint32_t accountId, uint32_t appId,
@@ -536,17 +591,13 @@ bool RemoveManifestEntry(uint32_t accountId, uint32_t appId,
     auto mtx = AcquireAppSyncMutex(accountId, appId);
     std::lock_guard<std::mutex> lock(*mtx);
 
-    Manifest manifest = LoadLocalManifest(accountId, appId);
-    auto repairStatus = RepairCloudManifest(accountId, appId, manifest);
-    if (repairStatus == ManifestRepairStatus::Incomplete) {
-        manifest = BuildManifestFromLocalBlobs(accountId, appId);
-        if (manifest.empty()) return false;
-    }
+    Manifest manifest;
+    if (!TryLoadLocalManifest(accountId, appId, manifest)) return true;
 
     auto it = manifest.find(filename);
     if (it == manifest.end()) return true;
     manifest.erase(it);
-    return SaveManifest(accountId, appId, manifest);
+    return SaveManifestLocal(accountId, appId, manifest);
 }
 
 // --- manifest snapshots for Steam-faithful delta changelist ---
@@ -627,7 +678,7 @@ ManifestDelta ComputeManifestDelta(uint32_t accountId, uint32_t appId,
     Manifest current;
     if (serverCN == clientCN) {
         if (!snapshotExists) {
-            // Snapshot missing at this CN — can't verify "already synced."
+            // Snapshot missing at this CN -- can't verify "already synced."
             // Signal to caller: fall back to full manifest.
             delta.serverCN = 0;
         }
@@ -643,7 +694,6 @@ ManifestDelta ComputeManifestDelta(uint32_t accountId, uint32_t appId,
         current = serverManifest;
     } else {
         current = LoadLocalManifest(accountId, appId);
-        if (current.empty()) current = BuildManifestFromLocalBlobs(accountId, appId);
     }
     if (current.empty()) return delta;
 

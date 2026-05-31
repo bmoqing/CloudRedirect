@@ -22,24 +22,45 @@ inline constexpr const char* RPC_CONFLICT            = "Cloud.ClientConflictReso
 inline constexpr const char* RPC_SYNC_STATS          = "ClientMetrics.ClientCloudAppSyncStats#1";
 inline constexpr const char* RPC_TRANSFER_REPORT     = "Cloud.ExternalStorageTransferReport#1";
 
+// Steam EResult values used by the cloud RPC layer.
+inline constexpr int32_t kEResultOK       = 1;
+inline constexpr int32_t kEResultFail     = 2;
+inline constexpr int32_t kEResultDisabled = 108;
+
+// RPC response: body bytes + optional EResult override.
+struct RpcResult {
+    PB::Writer body;
+    int32_t    eresult = kEResultOK;
+
+    RpcResult() = default;
+    RpcResult(PB::Writer b) : body(std::move(b)) {}
+    RpcResult(PB::Writer b, int32_t er) : body(std::move(b)), eresult(er) {}
+};
+
 // ExtractAppId, BuildBeginBatchResponseBody, ParseCompleteBatchRequest,
 // and CompleteBatchRequestInfo have moved to cloud_rpc_utils.h (namespace CloudRpcUtils).
 // Use CloudRpcUtils::ExtractAppId(...) etc.
 
-PB::Writer HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqBody);
-PB::Writer HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBody);
-PB::Writer HandleSuspendSession(uint32_t appId, const std::vector<PB::Field>& reqBody);
-PB::Writer HandleResumeSession(uint32_t appId, const std::vector<PB::Field>& reqBody);
-PB::Writer HandleQuotaUsage(uint32_t appId, const std::vector<PB::Field>& reqBody);
-PB::Writer HandleBeginBatch(uint32_t appId, const std::vector<PB::Field>& reqBody);
-PB::Writer HandleBeginFileUpload(uint32_t appId, const std::vector<PB::Field>& reqBody);
-PB::Writer HandleCommitFileUpload(uint32_t appId, const std::vector<PB::Field>& reqBody);
-PB::Writer HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqBody);
-PB::Writer HandleFileDownload(uint32_t appId, const std::vector<PB::Field>& reqBody);
-PB::Writer HandleDeleteFile(uint32_t appId, const std::vector<PB::Field>& reqBody);
+RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqBody);
+RpcResult HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBody);
+RpcResult HandleSuspendSession(uint32_t appId, const std::vector<PB::Field>& reqBody);
+RpcResult HandleResumeSession(uint32_t appId, const std::vector<PB::Field>& reqBody);
+RpcResult HandleQuotaUsage(uint32_t appId, const std::vector<PB::Field>& reqBody);
+RpcResult HandleBeginBatch(uint32_t appId, const std::vector<PB::Field>& reqBody);
+RpcResult HandleBeginFileUpload(uint32_t appId, const std::vector<PB::Field>& reqBody);
+RpcResult HandleCommitFileUpload(uint32_t appId, const std::vector<PB::Field>& reqBody);
+RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqBody);
+RpcResult HandleFileDownload(uint32_t appId, const std::vector<PB::Field>& reqBody);
+RpcResult HandleDeleteFile(uint32_t appId, const std::vector<PB::Field>& reqBody);
 
 void RestoreAppMetadata(uint32_t accountId, uint32_t appId);
 void ShutdownRpcHandlers();
+
+void RecordConflictResolution(uint32_t appId, bool choseLocal);
+bool ConsumeConflictLocalChoice(uint32_t appId);
+
+// Flush pending sync icon states to registry.vdf (Linux, called from OnUnload).
+void FlushPendingSyncStates();
 
 // True if the UserGameStats blob has any non-zero stat/achievement data.
 // Empty stubs and unparseable input return false.

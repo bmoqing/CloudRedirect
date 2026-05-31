@@ -1,6 +1,8 @@
 #include "cloud_intercept.h"
 #include "rpc_handlers.h"
+#include "app_state.h"
 #include "protobuf.h"
+#include "parental_bypass.h"
 #include "log.h"
 #include "http_server.h"
 #include "vdf.h"
@@ -82,7 +84,7 @@ static constexpr size_t SC_BDD_STOLEN_BYTES = 14;  // first 14 bytes of prologue
 static constexpr uintptr_t SC_RVA_GLOBAL_ENGINE     = 0x17BEA48;
 // CCMInterface vtable RVA (for validation)
 static constexpr uintptr_t SC_RVA_CCMINTERFACE_VT   = 0x126A0F0;
-// sub_138D199E0 = CNetPacket→CProtoBufNetPacket wrapper
+// sub_138D199E0 = CNetPacket->CProtoBufNetPacket wrapper
 static constexpr uintptr_t SC_RVA_WRAP_PACKET       = 0xCF62A0;
 // sub_138D263B0 = CJobMgr::BRouteMsgToJob
 static constexpr uintptr_t SC_RVA_BROUTEMSG         = 0xD022B0;
@@ -158,7 +160,7 @@ using NotificationSlot8Fn = bool(__fastcall*)(void* thisptr, const char* methodN
 //   rdx = raw data pointer
 //   r8  = raw data size (as int)
 using ParseFromArrayFn = char(__fastcall*)(void* msgBody, const char* data, int size);
-// sub_138BD07E0: SerializeToArray — writes protobuf message to a buffer
+// sub_138BD07E0: SerializeToArray -- writes protobuf message to a buffer
 //   rcx = protobuf message object
 //   rdx = output buffer pointer
 //   r8  = buffer size (int)
@@ -273,6 +275,9 @@ static void ScheduleStartupMetadataSync() {
 static std::atomic<bool> g_syncAchievements{false};
 static std::atomic<bool> g_syncPlaytime{false};
 static std::atomic<bool> g_syncLuas{false};
+
+static std::atomic<bool> g_parentalBypassPlaytime{false};
+static std::atomic<bool> g_parentalIgnorePlaytime{false};
 static std::atomic<uint64_t> g_detectedSteamVersion{0};
 
 // Cloud-redirect master toggle (default ON). When OFF the DLL still applies manifest pinning + patches but skips HTTP/storage/interception.
@@ -676,10 +681,10 @@ static std::vector<uint8_t> BuildPacket(uint32_t emsg, const PB::Writer& header,
 // CCMInterface discovery via CSteamEngine global
 //
 // Traversal: qword_139781D38 (global CSteamEngine*)
-//   → engine+3144 (uint32 global user handle)
-//   → engine+3296 (CUtlSortedVector user map)
-//     → array[i] where handle matches → CUser*
-//   → CUser+72 (CCMInterface embedded in CBaseUser)
+//   ΓåÆ engine+3144 (uint32 global user handle)
+//   ΓåÆ engine+3296 (CUtlSortedVector user map)
+//     ΓåÆ array[i] where handle matches ΓåÆ CUser*
+//   ΓåÆ CUser+72 (CCMInterface embedded in CBaseUser)
 static void* FindCCMInterface() {
     uintptr_t userPtr = FindCurrentUser();
     if (!userPtr) return nullptr;
@@ -1166,15 +1171,13 @@ static bool ParseBytesToBody(void* bodyObj, const uint8_t* data, size_t size) {
 }
 
 // SEH-safe header field writing
-static bool SEH_WriteResponseHeader(void* respHeader) {
+static bool SEH_WriteResponseHeader(void* respHeader, int32_t eresult = 1) {
     __try {
-        // Set eresult = 1 (k_EResultOK)
         *(uint32_t*)((uintptr_t)respHeader + 16) |= 0x20000000u;
-        *(int32_t*)((uintptr_t)respHeader + 216) = 1;  // eresult = OK
+        *(int32_t*)((uintptr_t)respHeader + 216) = eresult;
 
-        // Set the error_message related field (slot 5 does this too)
         *(uint32_t*)((uintptr_t)respHeader + 16) |= 0x40000000u;
-        *(int32_t*)((uintptr_t)respHeader + 220) = 0;  // no error
+        *(int32_t*)((uintptr_t)respHeader + 220) = 0;
         return true;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG("[VtHook] EXCEPTION writing response header: code=0x%08X", GetExceptionCode());
@@ -1184,7 +1187,7 @@ static bool SEH_WriteResponseHeader(void* respHeader) {
 
 // Shared Cloud RPC dispatch - routes a method name to the appropriate handler.
 // Returns std::nullopt if the method is not a recognized Cloud RPC we handle.
-static std::optional<PB::Writer> DispatchCloudRpc(
+static std::optional<RpcResult> DispatchCloudRpc(
     const char* method, uint32_t appId, const std::vector<PB::Field>& reqBody) {
     if (strcmp(method, RPC_GET_CHANGELIST) == 0)       return HandleGetChangelist(appId, reqBody);
     if (strcmp(method, RPC_LAUNCH_INTENT) == 0)        return HandleLaunchIntent(appId, reqBody);
@@ -1213,7 +1216,30 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
         return g_originalSlot4(thisptr, methodName, requestBody, responseBody, flags);
     }
 
-    // Fast check: only intercept Cloud.* methods
+    if (g_parentalBypassPlaytime.load() &&
+        strcmp(methodName, "Parental.GetSignedParentalSettings#1") == 0) {
+        bool result = g_originalSlot4(thisptr, methodName, requestBody, responseBody, flags);
+        if (result && responseBody) {
+            auto respBytes = SerializeBodyToBytes(responseBody);
+            auto respFields = PB::Parse(respBytes.data(), respBytes.size());
+            const PB::Field* sf = PB::FindField(respFields, 1);
+            if (sf && sf->wireType == PB::LengthDelimited && sf->data) {
+                auto stripped = ParentalBypass::StripPlaytimeRestrictions(sf->data, sf->dataLen);
+                PB::Writer newResp;
+                newResp.WriteBytes(1, stripped.data(), stripped.size());
+                for (const auto& f : respFields) {
+                    if (f.fieldNum == 1) continue;
+                    if (f.wireType == PB::Varint)        newResp.WriteVarint(f.fieldNum, f.varintVal);
+                    else if (f.wireType == PB::Fixed64)  newResp.WriteFixed64(f.fieldNum, f.varintVal);
+                    else if (f.wireType == PB::LengthDelimited) newResp.WriteBytes(f.fieldNum, f.data, f.dataLen);
+                }
+                if (ParseBytesToBody(responseBody, newResp.Data().data(), newResp.Size()))
+                    LOG("[Parental] Stripped restrictions from GetSignedParentalSettings (slot4)");
+            }
+        }
+        return result;
+    }
+
     if (strncmp(methodName, "Cloud.", 6) != 0) {
         return g_originalSlot4(thisptr, methodName, requestBody, responseBody, flags);
     }
@@ -1265,22 +1291,18 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
     // Capture SteamID from request header if not already cached.
 
     // Call the appropriate handler to build a response body
-    PB::Writer responseBodyPB;
-
     auto dispatched = DispatchCloudRpc(methodName, realAppId, innerFields);
     if (!dispatched.has_value()) {
         LOG("[Slot4] Unhandled method %s, passing through", methodName);
         return g_originalSlot4(thisptr, methodName, requestBody, responseBody, flags);
     }
-    responseBodyPB = std::move(*dispatched);
+    auto& result = *dispatched;
 
-    LOG("[Slot4] %s: response body %zu bytes", methodName, responseBodyPB.Size());
+    LOG("[Slot4] %s: response body %zu bytes, eresult=%d", methodName, result.body.Size(), result.eresult);
 
     // Write the response body into the response protobuf object
-    if (responseBody && responseBodyPB.Size() > 0) {
-        if (!ParseBytesToBody(responseBody, responseBodyPB.Data().data(), responseBodyPB.Size())) {
-            // ParseBytesToBody may have partially modified the response object.
-            // Passing through to g_originalSlot4 with a corrupted response is unsafe.
+    if (responseBody && result.body.Size() > 0) {
+        if (!ParseBytesToBody(responseBody, result.body.Data().data(), result.body.Size())) {
             LOG("[Slot4] %s: ParseFromArray failed for response body! Returning transport failure.", methodName);
             return false;
         }
@@ -1288,12 +1310,12 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
 
     // Flags layout (from IDA decompilation of sub_138914710 / sub_138914A30):
     //   [0-1]: __int64 (routing/request context, leave untouched)
-    //   [2]:   int  - transport success flag (1 = OK, 0 = transport failure → triggers k_EResultTimeout=16)
-    //   [3]:   int  - eresult from response header (1 = k_EResultOK)
+    //   [2]:   int  - transport success flag (1 = OK, 0 = transport failure -> triggers k_EResultTimeout=16)
+    //   [3]:   int  - eresult from response header (1 = k_EResultOK, 108 = k_EResultDisabled)
     //   [4+]:  char[] - error message string (null-terminated)
     if (flags) {
         flags[2] = 1;  // transport_success = true (MUST be 1, or caller returns k_EResultTimeout!)
-        flags[3] = 1;  // eresult = k_EResultOK
+        flags[3] = result.eresult;
         flags[4] = 0;  // error_message = "" (null terminator)
     }
 
@@ -1311,7 +1333,33 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
-    // Fast check: only intercept Cloud.* methods
+    if (g_parentalBypassPlaytime.load() &&
+        strcmp(methodName, "Parental.GetSignedParentalSettings#1") == 0) {
+        bool result = g_originalSlot5(thisptr, methodName, request, response, flags);
+        if (result && response) {
+            void* respBody = *(void**)((uintptr_t)response + 48);
+            if (respBody) {
+                auto respBytes = SerializeBodyToBytes(respBody);
+                auto respFields = PB::Parse(respBytes.data(), respBytes.size());
+                const PB::Field* sf = PB::FindField(respFields, 1);
+                if (sf && sf->wireType == PB::LengthDelimited && sf->data) {
+                    auto stripped = ParentalBypass::StripPlaytimeRestrictions(sf->data, sf->dataLen);
+                    PB::Writer newResp;
+                    newResp.WriteBytes(1, stripped.data(), stripped.size());
+                    for (const auto& f : respFields) {
+                        if (f.fieldNum == 1) continue;
+                        if (f.wireType == PB::Varint)        newResp.WriteVarint(f.fieldNum, f.varintVal);
+                        else if (f.wireType == PB::Fixed64)  newResp.WriteFixed64(f.fieldNum, f.varintVal);
+                        else if (f.wireType == PB::LengthDelimited) newResp.WriteBytes(f.fieldNum, f.data, f.dataLen);
+                    }
+                    if (ParseBytesToBody(respBody, newResp.Data().data(), newResp.Size()))
+                        LOG("[Parental] Stripped restrictions from GetSignedParentalSettings (slot5)");
+                }
+            }
+        }
+        return result;
+    }
+
     if (strncmp(methodName, "Cloud.", 6) != 0) {
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
@@ -1369,7 +1417,9 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
 
     if (!isNamespace) {
         // Not a namespace app - pass through to real Steam servers
-        LOG("[VtHook] %s app=%u: not namespace, passing through", methodName, appId);
+        // Suppress log for high-frequency non-namespace apps (e.g. 2371090 = Steam Game Notes)
+        if (appId != 2371090)
+            LOG("[VtHook] %s app=%u: not namespace, passing through", methodName, appId);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
@@ -1403,16 +1453,14 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
     }
 
     // Call the appropriate handler to build a response body
-    PB::Writer responseBody;
-
     auto dispatched = DispatchCloudRpc(methodName, realAppId, innerFields);
     if (!dispatched.has_value()) {
         LOG("[VtHook] Unhandled method %s, passing through", methodName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
-    responseBody = std::move(*dispatched);
+    auto& result = *dispatched;
 
-    LOG("[VtHook] %s: response body %zu bytes", methodName, responseBody.Size());
+    LOG("[VtHook] %s: response body %zu bytes, eresult=%d", methodName, result.body.Size(), result.eresult);
 
     // Validate response header BEFORE writing body to avoid corrupting the
     // response protobuf object on a failure path.
@@ -1429,42 +1477,38 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
-    if (responseBody.Size() > 0) {
-        if (!ParseBytesToBody(respBody, responseBody.Data().data(), responseBody.Size())) {
-            // ParseBytesToBody may have partially modified the response object.
-            // Passing through to g_originalSlot5 with a corrupted response is unsafe.
+    if (result.body.Size() > 0) {
+        if (!ParseBytesToBody(respBody, result.body.Data().data(), result.body.Size())) {
             LOG("[VtHook] %s: ParseFromArray failed for response body! Returning transport failure.", methodName);
             return false;
         }
     }
 
-    // Set eresult=1 in the response header (CProtoBufMsg+40):
-    //   has_bits |= 0x20000000 (eresult), |= 2 (target_job_name), |= 0x40000000 (error_message)
+    // Write eresult into response header (CProtoBufMsg+40):
+    //   has_bits |= 0x20000000 (eresult), |= 0x40000000 (error_message)
     //   header+216 = eresult, header+220 = error_code
-    if (!SEH_WriteResponseHeader(respHeader)) {
+    if (!SEH_WriteResponseHeader(respHeader, result.eresult)) {
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
-    LOG("[VtHook] Set response header: eresult=1, error=0");
+    LOG("[VtHook] Set response header: eresult=%d, error=0", result.eresult);
 
     // Populate flags output (caller reads in addition to the header).
     if (flags) {
         // flags layout (from slot 5):
-        //   flags[0] = int32_t routing_appid (slot 5 reads *(reqHeader+116) and writes to flags[0])
+        //   flags[0] = int32_t routing_appid
         //   flags[1] = int32_t (always 1, set in slot 5 constructor)
-        //   flags[2] = int32_t error_code → written to respHeader+220
-        //   flags[3] = int32_t eresult → written to respHeader+216
+        //   flags[2] = int32_t error_code -> written to respHeader+220
+        //   flags[3] = int32_t eresult -> written to respHeader+216
         //   flags[4..] = char[256] target_job_name
-        // flags is int64_t* but actual layout is int32_t[68].
-        // Use int32_t* cast to avoid zeroing adjacent fields.
         int32_t* f32 = reinterpret_cast<int32_t*>(flags);
         f32[0] = 0;  // routing_appid (not relevant for our response)
         // f32[1] already set by caller (= 1)
         f32[2] = 0;  // error_code
-        f32[3] = 1;  // eresult = OK
+        f32[3] = result.eresult;
     }
 
     LOG("[VtHook] SUCCESS: %s app=%u handled locally (response %zu bytes)",
-        methodName, realAppId, responseBody.Size());
+        methodName, realAppId, result.body.Size());
     return true;
 }
 
@@ -1557,8 +1601,7 @@ static void UploadStatsOnExit(uint32_t appId) {
     LOG("[Stats] Uploaded stats for app %u (%zu bytes, ok=%d)", appId, data.size(), ok);
 
     if (ok) {
-        CloudStorage::DeleteBlob(accountId, appId, kLegacyStatsMetadataPath,
-                                 /*keepTombstoneOnSuccess=*/true);
+        CloudStorage::DeleteBlob(accountId, appId, kLegacyStatsMetadataPath);
     }
 }
 
@@ -1733,8 +1776,7 @@ static void UploadPlaytimeOnExit(uint32_t appId) {
         cloudPlaytime, cloudPlaytime2wks, mergedPlaytime, mergedPlaytime2wks, mergedLastPlayed, ok);
 
     if (ok) {
-        CloudStorage::DeleteBlob(accountId, appId, kLegacyPlaytimeMetadataPath,
-                                 /*keepTombstoneOnSuccess=*/true);
+        CloudStorage::DeleteBlob(accountId, appId, kLegacyPlaytimeMetadataPath);
     }
 }
 
@@ -1745,6 +1787,36 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
     if (g_shuttingDown.load(std::memory_order_acquire))
         return g_originalSlot8(thisptr, methodName, request);
     if (!methodName) {
+        return g_originalSlot8(thisptr, methodName, request);
+    }
+
+    if (ParentalBypass::IsParentalNotification(methodName) && g_parentalBypassPlaytime.load()) {
+        if (request) {
+            void* bodyObj = *(void**)((uintptr_t)request + 48);
+            if (bodyObj && strcmp(methodName, ParentalBypass::NOTIFY_SETTINGS_CHANGE) == 0) {
+                auto bodyBytes = SerializeBodyToBytes(bodyObj);
+                auto notifFields = PB::Parse(bodyBytes.data(), bodyBytes.size());
+                const PB::Field* sf = PB::FindField(notifFields, ParentalBypass::NotifyFields::SERIALIZED_SETTINGS);
+                if (sf && sf->wireType == PB::LengthDelimited && sf->data) {
+                    auto stripped = ParentalBypass::StripPlaytimeRestrictions(sf->data, sf->dataLen);
+                    PB::Writer newNotif;
+                    newNotif.WriteBytes(ParentalBypass::NotifyFields::SERIALIZED_SETTINGS,
+                                       stripped.data(), stripped.size());
+                    for (const auto& f : notifFields) {
+                        if (f.fieldNum == ParentalBypass::NotifyFields::SERIALIZED_SETTINGS) continue;
+                        if (f.wireType == PB::Varint)        newNotif.WriteVarint(f.fieldNum, f.varintVal);
+                        else if (f.wireType == PB::Fixed64)  newNotif.WriteFixed64(f.fieldNum, f.varintVal);
+                        else if (f.wireType == PB::LengthDelimited) newNotif.WriteBytes(f.fieldNum, f.data, f.dataLen);
+                    }
+                    if (ParseBytesToBody(bodyObj, newNotif.Data().data(), newNotif.Size()))
+                        LOG("[Parental] Stripped restrictions from NotifySettingsChange");
+                }
+            }
+            if (ParentalBypass::ShouldSuppressNotification(methodName)) {
+                LOG("[Parental] SUPPRESSED %s", methodName);
+                return true;
+            }
+        }
         return g_originalSlot8(thisptr, methodName, request);
     }
 
@@ -1768,10 +1840,9 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
         return g_originalSlot8(thisptr, methodName, request);
     }
 
-    // ExitSyncDone: upload stats/playtime, then suppress (don't forward to Valve).
-    // CN advancement is handled by UpdateRemotecacheVdfChangeNumber in CompleteBatch.
-    // Forwarding to Valve would confuse server-side CN tracking for namespace apps
-    // since Valve never received the upload data.
+    // ExitSyncDone: let Steam's internal processing fire so it updates
+    // remotecache.vdf with the CN from BeginAppUploadBatch. The notification
+    // reaches Valve with a namespace app ID it has no record for -- harmless.
     if (strcmp(methodName, RPC_EXIT_SYNC) == 0) {
         auto bodyBytes = SerializeBodyToBytes(bodyObj);
         auto fields = PB::Parse(bodyBytes.data(), bodyBytes.size());
@@ -1785,6 +1856,8 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
         if (accountId != 0) {
             PendingOpsJournal::RecordExitSyncState(accountId, realAppId,
                 uploadsCompleted, uploadsRequired, clientId);
+            // Release cloud session lock -- server-faithful: sync done, release ownership.
+            CloudStorage::ReleaseCloudSession(accountId, realAppId, clientId);
         }
         if (!g_shuttingDown.load(std::memory_order_acquire)) {
             uint32_t capturedAppId = realAppId;
@@ -1792,17 +1865,25 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
                 if (g_syncAchievements) UploadStatsOnExit(capturedAppId);
                 if (g_syncPlaytime) UploadPlaytimeOnExit(capturedAppId);
             });
-            // Re-check shutdown under the same lock used to splice out the
-            // vector, so we never push into an already-drained list.
             std::lock_guard<std::mutex> lock(g_bgThreadsMutex);
             if (g_shuttingDown.load(std::memory_order_acquire)) {
-                t.detach(); // OS reaps at process exit
+                t.detach();
             } else {
                 g_bgThreads.push_back(std::move(t));
             }
         }
-        LOG("[VtHook-Notif] SUPPRESSED %s app=%u (namespace -- CN managed locally)", methodName, realAppId);
-        return true;
+        LOG("[VtHook-Notif] %s app=%u: letting Steam process internally", methodName, realAppId);
+        return g_originalSlot8(thisptr, methodName, request);
+    }
+
+    // ConflictResolution: parse chose_local_files so HandleLaunchIntent
+    // knows whether to skip pre-restore (user chose "keep local files").
+    if (strcmp(methodName, RPC_CONFLICT) == 0 && bodyObj) {
+        auto bodyBytes = SerializeBodyToBytes(bodyObj);
+        auto fields = PB::Parse(bodyBytes.data(), bodyBytes.size());
+        bool choseLocal = false;
+        if (auto* f = PB::FindField(fields, 2)) choseLocal = f->varintVal != 0;
+        RecordConflictResolution(realAppId, choseLocal);
     }
 
     // Suppress other Cloud notifications for namespace apps
@@ -1820,6 +1901,33 @@ static bool __fastcall NotificationDirectHook(void* thisptr, const char* methodN
         return g_originalSlot7(thisptr, methodName, bodyObj, flags);
     }
 
+    if (ParentalBypass::IsParentalNotification(methodName) && g_parentalBypassPlaytime.load()) {
+        if (bodyObj && strcmp(methodName, ParentalBypass::NOTIFY_SETTINGS_CHANGE) == 0) {
+            auto bodyBytes = SerializeBodyToBytes(bodyObj);
+            auto notifFields = PB::Parse(bodyBytes.data(), bodyBytes.size());
+            const PB::Field* sf = PB::FindField(notifFields, ParentalBypass::NotifyFields::SERIALIZED_SETTINGS);
+            if (sf && sf->wireType == PB::LengthDelimited && sf->data) {
+                auto stripped = ParentalBypass::StripPlaytimeRestrictions(sf->data, sf->dataLen);
+                PB::Writer newNotif;
+                newNotif.WriteBytes(ParentalBypass::NotifyFields::SERIALIZED_SETTINGS,
+                                   stripped.data(), stripped.size());
+                for (const auto& f : notifFields) {
+                    if (f.fieldNum == ParentalBypass::NotifyFields::SERIALIZED_SETTINGS) continue;
+                    if (f.wireType == PB::Varint)        newNotif.WriteVarint(f.fieldNum, f.varintVal);
+                    else if (f.wireType == PB::Fixed64)  newNotif.WriteFixed64(f.fieldNum, f.varintVal);
+                    else if (f.wireType == PB::LengthDelimited) newNotif.WriteBytes(f.fieldNum, f.data, f.dataLen);
+                }
+                if (ParseBytesToBody(bodyObj, newNotif.Data().data(), newNotif.Size()))
+                    LOG("[Parental] Stripped restrictions from NotifySettingsChange (direct)");
+            }
+        }
+        if (ParentalBypass::ShouldSuppressNotification(methodName)) {
+            LOG("[Parental] SUPPRESSED %s (direct)", methodName);
+            return true;
+        }
+        return g_originalSlot7(thisptr, methodName, bodyObj, flags);
+    }
+
     // Only intercept Cloud.* notifications
     if (strncmp(methodName, "Cloud.", 6) != 0) {
         return g_originalSlot7(thisptr, methodName, bodyObj, flags);
@@ -1833,8 +1941,9 @@ static bool __fastcall NotificationDirectHook(void* thisptr, const char* methodN
         return g_originalSlot7(thisptr, methodName, bodyObj, flags);
     }
 
-    // ExitSyncDone: upload stats/playtime, then suppress (don't forward to Valve).
-    // See slot 8 handler comment for rationale.
+    // ExitSyncDone: let Steam's internal processing fire so it updates
+    // remotecache.vdf with the CN from BeginAppUploadBatch. The notification
+    // reaches Valve with a namespace app ID it has no record for -- harmless.
     if (strcmp(methodName, RPC_EXIT_SYNC) == 0) {
         auto bodyBytes = SerializeBodyToBytes(bodyObj);
         auto fields = PB::Parse(bodyBytes.data(), bodyBytes.size());
@@ -1848,23 +1957,22 @@ static bool __fastcall NotificationDirectHook(void* thisptr, const char* methodN
         if (accountId != 0) {
             PendingOpsJournal::RecordExitSyncState(accountId, realAppId,
                 uploadsCompleted, uploadsRequired, clientId);
+            // ReleaseCloudSession and stats/playtime upload handled by slot 8
+            // (NotificationWrapperHook). Slot 7 is a cascade from the same
+            // notification -- don't duplicate cloud I/O.
         }
-        if (!g_shuttingDown.load(std::memory_order_acquire)) {
-            uint32_t capturedAppId = realAppId;
-            std::thread t([capturedAppId] {
-                if (g_syncAchievements) UploadStatsOnExit(capturedAppId);
-                if (g_syncPlaytime) UploadPlaytimeOnExit(capturedAppId);
-            });
-            // See NotificationHook (slot 8) above - same shutdown-window race.
-            std::lock_guard<std::mutex> lock(g_bgThreadsMutex);
-            if (g_shuttingDown.load(std::memory_order_acquire)) {
-                t.detach();
-            } else {
-                g_bgThreads.push_back(std::move(t));
-            }
-        }
-        LOG("[VtHook-Notif] SUPPRESSED %s app=%u (direct, namespace -- CN managed locally)", methodName, realAppId);
-        return true;
+        LOG("[VtHook-Notif] %s app=%u (direct): cascade from slot 8, passing through", methodName, realAppId);
+        return g_originalSlot7(thisptr, methodName, bodyObj, flags);
+    }
+
+    // ConflictResolution: parse chose_local_files so HandleLaunchIntent
+    // knows whether to skip pre-restore (user chose "keep local files").
+    if (strcmp(methodName, RPC_CONFLICT) == 0) {
+        auto bodyBytes = SerializeBodyToBytes(bodyObj);
+        auto fields = PB::Parse(bodyBytes.data(), bodyBytes.size());
+        bool choseLocal = false;
+        if (auto* f = PB::FindField(fields, 2)) choseLocal = f->varintVal != 0;
+        RecordConflictResolution(realAppId, choseLocal);
     }
 
     // Suppress other Cloud notifications for namespace apps
@@ -2382,7 +2490,9 @@ static int64_t __fastcall RecvPktMonitorHook(void* thisptr, CNetPacket* pkt) {
         if (method.find("Cloud.") != std::string::npos) {
             auto* eresultField = PB::FindField(p.header, HDR_ERESULT);
             int32_t eresult = eresultField ? (int32_t)eresultField->varintVal : -1;
-            LOG("[RecvMon] %s eresult=%d body=%u bytes", method.c_str(), eresult, p.bodyLen);
+            // Suppress passthrough changelist responses (non-namespace apps spam these)
+            if (method.find("GetAppFileChangelist") == std::string::npos)
+                LOG("[RecvMon] %s eresult=%d body=%u bytes", method.c_str(), eresult, p.bodyLen);
 
             // Hex dump + protobuf parse for changelist responses (for comparing real vs ours)
 #ifdef DEBUG_HEX_DUMP
@@ -3138,7 +3248,7 @@ static void PreStageStatsFromLocalCache(const std::string& steamPath) {
 // DLL auto-update: check GitHub for a newer cloud_redirect.dll, replace on disk.
 
 static bool ParseVersion(const std::string& s, int out[3]) {
-    // "2.0.3" or "v2.0.3" → {2, 0, 3}
+    // "2.0.3" or "v2.0.3" ΓåÆ {2, 0, 3}
     const char* p = s.c_str();
     if (*p == 'v' || *p == 'V') ++p;
     return sscanf(p, "%d.%d.%d", &out[0], &out[1], &out[2]) == 3;
@@ -3536,7 +3646,7 @@ void Init(const std::string& steamPath) {
     if (!g_steamPath.empty() && g_steamPath.back() != '\\')
         g_steamPath += '\\';
 
-    // ── Steam version gate ──────────────────────────────────────────────
+    // Steam version gate
     uint64_t detectedVersion = ReadSteamVersion(g_steamPath);
     g_detectedSteamVersion.store(detectedVersion, std::memory_order_relaxed);
     if (detectedVersion == 0) {
@@ -3957,8 +4067,20 @@ void Init(const std::string& steamPath) {
             g_syncPlaytime = cfg["sync_playtime"].boolean();
         if (cfg["sync_luas"].type == Json::Type::Bool)
             g_syncLuas = cfg["sync_luas"].boolean();
-        LOG("[NS] Sync toggles: achievements=%d, playtime=%d, luas=%d",
-            g_syncAchievements.load(), g_syncPlaytime.load(), g_syncLuas.load());
+        if (cfg["parental_bypass_playtime"].type == Json::Type::Bool)
+            g_parentalBypassPlaytime = cfg["parental_bypass_playtime"].boolean();
+        if (cfg["parental_ignore_playtime"].type == Json::Type::Bool)
+            g_parentalIgnorePlaytime = cfg["parental_ignore_playtime"].boolean();
+        LOG("[NS] Parental: bypass=%d, ignore_playtime=%d",
+            g_parentalBypassPlaytime.load(), g_parentalIgnorePlaytime.load());
+
+        if (g_parentalBypassPlaytime.load() || g_parentalIgnorePlaytime.load()) {
+            ParentalBypass::PatchParentalSignatureCheck();
+            ParentalBypass::InstallParentalSettingsHook(g_parentalBypassPlaytime.load());
+        }
+        if (g_parentalIgnorePlaytime.load()) {
+            ParentalBypass::PatchPlaytimeEnforcement();
+        }
 
         // DLL auto-update (default OFF)
         if (cfg["auto_update_dll"].type == Json::Type::Bool && cfg["auto_update_dll"].boolean()) {
@@ -4118,6 +4240,12 @@ void InstallManifestPinHook() {
         g_bddOrigAddr, (void*)hookAddr);
 }
 
+void InstallReleaseStateNop() {
+    // Stub -- release-state patching removed from public builds.
+}
+
+
+
 void SetSendPktAddr(void* recvPktGlobalAddr) {
     if (!recvPktGlobalAddr) {
         LOG("[NS] SetSendPktAddr: recvPktGlobalAddr is null");
@@ -4128,11 +4256,9 @@ void SetSendPktAddr(void* recvPktGlobalAddr) {
     LOG("[NS] payload_base=%p", (void*)g_payloadBase);
 }
 
-// OnSendPkt
-// When vtable hook (Approach E) is active: only handles CCMInterface discovery,
-// SteamID capture, and logging. Namespace Cloud RPCs are intercepted by the vtable hook.
-// When vtable hook is NOT active: falls back to Approach D (packet injection).
+// OnSendPkt — vtable hook handles namespace Cloud RPCs; this is the fallback path.
 bool OnSendPkt(void* thisptr, const uint8_t* data, uint32_t size) {
+
     if (!g_cloudRedirectEnabled.load(std::memory_order_relaxed)) return false;
     if (g_proxySending) return false;
     // After Shutdown() the receive thread is gone; refuse new pushes so
@@ -4151,6 +4277,7 @@ bool OnSendPkt(void* thisptr, const uint8_t* data, uint32_t size) {
 
     PacketView pkt;
     if (!ParsePacket(data, size, pkt)) return false;
+
     if (pkt.emsg != EMSG_SERVICE_METHOD) return false;
 
     auto methodSv = PB::GetString(pkt.header, HDR_TARGET_JOB_NAME);
@@ -4192,15 +4319,17 @@ bool OnSendPkt(void* thisptr, const uint8_t* data, uint32_t size) {
             bool isNs = IsNamespaceApp(appId);
 
             if (isNs) {
-                // Namespace app Cloud RPC reached SendPkt despite vtable hooks - unexpected!
-                int count = ++g_approachDFallbackCount;
-                LOG("[SendPkt] WARNING: %s app=%u (%u bytes) escaped vtable hooks! "
-                    "Using Approach D fallback (occurrence #%d)",
-                    method.c_str(), appId, pkt.bodyLen, count);
-                // Fall through to Approach D below
+                bool isPassthroughNotif = (method == RPC_EXIT_SYNC || method == RPC_CONFLICT);
+                if (!isPassthroughNotif) {
+                    int count = ++g_approachDFallbackCount;
+                    LOG("[SendPkt] WARNING: %s app=%u (%u bytes) escaped vtable hooks! "
+                        "Using Approach D fallback (occurrence #%d)",
+                        method.c_str(), appId, pkt.bodyLen, count);
+                }
             } else {
-                LOG("[SendPkt] %s app=%u (%u bytes) -- vtable hook active, passing through",
-                    method.c_str(), appId, pkt.bodyLen);
+                if (appId != 2371090)
+                    LOG("[SendPkt] %s app=%u (%u bytes) -- vtable hook active, passing through",
+                        method.c_str(), appId, pkt.bodyLen);
                 return false;
             }
         } else {
@@ -4245,7 +4374,13 @@ bool OnSendPkt(void* thisptr, const uint8_t* data, uint32_t size) {
 
     // ConflictResolution is a notification (no response expected)
     if (method == RPC_CONFLICT) {
-        LOG("[NS] ConflictResolution notification");
+        auto conflictFields = PB::Parse(pkt.bodyData, pkt.bodyLen);
+        uint32_t conflictAppId = CloudRpcUtils::ExtractAppId(method.c_str(), conflictFields);
+        bool choseLocal = false;
+        if (auto* f = PB::FindField(conflictFields, 2)) choseLocal = f->varintVal != 0;
+        if (conflictAppId && IsNamespaceApp(conflictAppId))
+            RecordConflictResolution(conflictAppId, choseLocal);
+        LOG("[NS] ConflictResolution notification app=%u choseLocal=%d", conflictAppId, choseLocal);
 #ifdef DEBUG_VERBOSE_LOGGING
         SpyLogFields("[Conflict]", pkt.bodyData, pkt.bodyLen);
 #endif
@@ -4288,17 +4423,15 @@ bool OnSendPkt(void* thisptr, const uint8_t* data, uint32_t size) {
     SpyLogFields("[NS-REQ]", pkt.bodyData, pkt.bodyLen);
 #endif
 
-    PB::Writer responseBody;
-
     auto dispatched = DispatchCloudRpc(method.c_str(), realAppId, innerFields);
     if (!dispatched.has_value()) {
         LOG("[NS-D] Unhandled method %s, passing through", method.c_str());
         return false;
     }
-    responseBody = std::move(*dispatched);
+    auto& result = *dispatched;
 
     // inject fabricated response via queue (old Approach D)
-    if (!InjectResponse(jobSrc, method, 1 /*eresult=success*/, responseBody)) {
+    if (!InjectResponse(jobSrc, method, result.eresult, result.body)) {
         LOG("[NS-D] Failed to inject response for %s, falling through", method.c_str());
         return false;
     }
@@ -4448,7 +4581,7 @@ static void ShutdownImpl() {
     // Restore vtable pointers before DLL unload, but skip if steamclient64
     // is gone (Steam's clean exit FreeLibrarys it before ExitProcess; the
     // cached base then points at unmapped memory and VirtualProtect 487s).
-    // Also skip if hook drain timed out — restoring slots with hooks in-flight
+    // Also skip if hook drain timed out -- restoring slots with hooks in-flight
     // risks control-flow corruption.
     if (!hookDrainTimedOut && g_vtableHookInstalled.load(std::memory_order_acquire) && g_steamClientBase) {
         HMODULE currentSC = GetModuleHandleA("steamclient64.dll");

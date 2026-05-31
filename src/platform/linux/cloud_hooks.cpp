@@ -1,6 +1,7 @@
 #include "cloud_hooks.h"
 #include "cloud_intercept.h"
 #include "rpc_handlers.h"
+#include "app_state.h"
 #include "local_storage.h"
 #include "pending_ops_journal.h"
 #include "cloud_storage.h"
@@ -32,6 +33,13 @@ static std::atomic<NotificationDirect_t> g_origNotificationDirect{nullptr};
 static std::atomic<SyncSend2_t>          g_origSyncSend2{nullptr};
 
 static std::atomic<bool> g_initialized{false};
+static std::atomic<bool> g_shuttingDown{false};
+static std::atomic<int>  g_hookRefCount{0};
+
+struct HookGuard {
+    HookGuard() { g_hookRefCount.fetch_add(1, std::memory_order_acquire); }
+    ~HookGuard() { g_hookRefCount.fetch_sub(1, std::memory_order_release); }
+};
 
 extern "C" void CR_SetCrashContext(const char* hook, const char* method, uint32_t appId);
 extern "C" void CR_ClearCrashContext();
@@ -208,7 +216,7 @@ static bool ParseIntoMessage(void* msg, const uint8_t* data, size_t len) {
     return g_parseFromArray(msg, data, (int)len) != 0;
 }
 
-static std::optional<PB::Writer> DispatchCloudRpc(
+static std::optional<CloudIntercept::RpcResult> DispatchCloudRpc(
     const char* method, uint32_t appId, const std::vector<PB::Field>& reqBody) {
     using namespace CloudIntercept;
     if (strcmp(method, RPC_GET_CHANGELIST) == 0)    return HandleGetChangelist(appId, reqBody);
@@ -318,6 +326,11 @@ static bool IsCloudRpc(const char* methodName) {
 
 extern "C" int hook_BYieldingSend(void* pThis, const char* methodName, void* request, void* response, int* flags)
 {
+    HookGuard guard;
+    if (g_shuttingDown.load(std::memory_order_acquire)) {
+        auto fn = g_origBYieldingSend.load(std::memory_order_acquire);
+        return fn ? fn(pThis, methodName, request, response, flags) : 0;
+    }
     CrashContextScope crashContext("BYieldingSend:entry", methodName, 0);
     auto origFn = g_origBYieldingSend.load(std::memory_order_acquire);
     
@@ -365,13 +378,14 @@ extern "C" int hook_BYieldingSend(void* pThis, const char* methodName, void* req
     if (!dispatched.has_value()) {
         return origFn(pThis, methodName, request, response, flags);
     }
+    auto& result = *dispatched;
 
-    LOG("[Hook] INTERCEPT BYieldingSend %s app=%u -> %zu bytes",
-        methodName, appId, dispatched->Size());
+    LOG("[Hook] INTERCEPT BYieldingSend %s app=%u -> %zu bytes, eresult=%d",
+        methodName, appId, result.body.Size(), result.eresult);
 
 #ifdef DEBUG_HEX_DUMP
     {
-        auto& d = dispatched->Data();
+        auto& d = result.body.Data();
         std::string hex;
         for (size_t i = 0; i < d.size() && i < 64; i++) {
             char tmp[4]; snprintf(tmp, sizeof(tmp), "%02X ", d[i]);
@@ -382,9 +396,9 @@ extern "C" int hook_BYieldingSend(void* pThis, const char* methodName, void* req
 #endif
 
     // Parse response bytes into the response protobuf object
-    if (response && dispatched->Size() > 0) {
+    if (response && result.body.Size() > 0) {
         CR_SetCrashContext("BYieldingSend:parse-response", methodName, appId);
-        if (!ParseIntoMessage(response, dispatched->Data().data(), dispatched->Size())) {
+        if (!ParseIntoMessage(response, result.body.Data().data(), result.body.Size())) {
             LOG("[Hook] BYieldingSend %s: ParseFromArray failed for response! Falling through.",
                 methodName);
             return origFn(pThis, methodName, request, response, flags);
@@ -392,10 +406,10 @@ extern "C" int hook_BYieldingSend(void* pThis, const char* methodName, void* req
         LOG("[Hook]   ParseFromArray succeeded");
     }
 
-    // Set flags to indicate success
+    // Flags layout: [0]=routing, [1]=mode, [2]=transport_success, [3]=eresult
     if (flags) {
         flags[2] = 1;  // transport success
-        flags[3] = 1;  // eresult = k_EResultOK
+        flags[3] = result.eresult;
     }
 
     LOG("[Hook]   returning success for %s app=%u", methodName, appId);
@@ -432,6 +446,11 @@ static uint32_t CheckNotificationNamespaceApp(const char* methodName, void* body
 
 extern "C" int hook_NotificationDirect(void* pThis, const char* methodName, void* body, int* flags)
 {
+    HookGuard guard;
+    if (g_shuttingDown.load(std::memory_order_acquire)) {
+        auto fn = g_origNotificationDirect.load(std::memory_order_acquire);
+        return fn ? fn(pThis, methodName, body, flags) : 0;
+    }
     CrashContextScope crashContext("NotificationDirect:entry", methodName, 0);
     auto origFn = g_origNotificationDirect.load(std::memory_order_acquire);
     for (int i = 0; !origFn && i < 1000; ++i) {
@@ -453,10 +472,7 @@ extern "C" int hook_NotificationDirect(void* pThis, const char* methodName, void
         return origFn(pThis, methodName, body, flags);
     }
 
-    // ExitSyncDone: record state, then suppress (don't forward to Valve).
-    // CN advancement is handled by UpdateRemotecacheVdfChangeNumber in CompleteBatch.
-    // Forwarding to Valve would confuse server-side CN tracking for namespace apps
-    // since Valve never received the upload data.
+    // ExitSyncDone: let Steam process it (updates remotecache.vdf CN).
     if (strcmp(methodName, CloudIntercept::RPC_EXIT_SYNC) == 0) {
         CR_SetCrashContext("NotificationDirect:exit-sync", methodName, appId);
         auto bodyBytes = SerializeMessage(body);
@@ -471,9 +487,20 @@ extern "C" int hook_NotificationDirect(void* pThis, const char* methodName, void
         if (accountId != 0) {
             PendingOpsJournal::RecordExitSyncState(accountId, appId,
                 uploadsCompleted, uploadsRequired, clientId);
+            CloudStorage::ReleaseCloudSession(accountId, appId, clientId);
         }
-        LOG("[Hook-Notif] SUPPRESSED %s app=%u (namespace -- CN managed locally)", methodName, appId);
-        return 1;
+        LOG("[Hook-Notif] %s app=%u: letting Steam process internally", methodName, appId);
+        return origFn(pThis, methodName, body, flags);
+    }
+
+    // ConflictResolution: parse chose_local_files so HandleLaunchIntent
+    // knows whether to skip pre-restore (user chose "keep local files").
+    if (strcmp(methodName, CloudIntercept::RPC_CONFLICT) == 0) {
+        auto bodyBytes = SerializeMessage(body);
+        auto fields = PB::Parse(bodyBytes.data(), bodyBytes.size());
+        bool choseLocal = false;
+        if (auto* f = PB::FindField(fields, 2)) choseLocal = f->varintVal != 0;
+        CloudIntercept::RecordConflictResolution(appId, choseLocal);
     }
 
     // Suppress other Cloud notifications for namespace apps
@@ -484,10 +511,15 @@ extern "C" int hook_NotificationDirect(void* pThis, const char* methodName, void
 // Hook: SyncSend2 (slot 8)
 //
 // 32-bit cdecl: int(void* this, const char* method, void* buf, uint32_t bufLen, void* resp, int* flags)
-// Buffer-based variant — raw protobuf bytes are directly available.
+// Buffer-based variant -- raw protobuf bytes are directly available.
 
 extern "C" int hook_SyncSend2(void* pThis, const char* methodName, void* buf, unsigned int bufLen, void* response, int* flags)
 {
+    HookGuard guard;
+    if (g_shuttingDown.load(std::memory_order_acquire)) {
+        auto fn = g_origSyncSend2.load(std::memory_order_acquire);
+        return fn ? fn(pThis, methodName, buf, bufLen, response, flags) : 0;
+    }
     CrashContextScope crashContext("SyncSend2:entry", methodName, 0);
     auto origFn = g_origSyncSend2.load(std::memory_order_acquire);
     for (int i = 0; !origFn && i < 1000; ++i) {
@@ -531,12 +563,14 @@ extern "C" int hook_SyncSend2(void* pThis, const char* methodName, void* buf, un
     if (!dispatched.has_value()) {
         return origFn(pThis, methodName, buf, bufLen, response, flags);
     }
+    auto& result = *dispatched;
 
-    LOG("[Hook] INTERCEPT SyncSend2 %s app=%u -> %zu bytes", methodName, appId, dispatched->Size());
+    LOG("[Hook] INTERCEPT SyncSend2 %s app=%u -> %zu bytes, eresult=%d",
+        methodName, appId, result.body.Size(), result.eresult);
 
-    if (response && dispatched->Size() > 0 && g_parseFromArray) {
+    if (response && result.body.Size() > 0 && g_parseFromArray) {
         CR_SetCrashContext("SyncSend2:parse-response", methodName, appId);
-        if (!ParseIntoMessage(response, dispatched->Data().data(), dispatched->Size())) {
+        if (!ParseIntoMessage(response, result.body.Data().data(), result.body.Size())) {
             LOG("[Hook] SyncSend2 %s: ParseFromArray failed", methodName);
             return origFn(pThis, methodName, buf, bufLen, response, flags);
         }
@@ -545,17 +579,15 @@ extern "C" int hook_SyncSend2(void* pThis, const char* methodName, void* buf, un
     // Flags layout (from IDA): [0]=routing, [1]=mode, [2]=transport_success, [3]=eresult
     if (flags) {
         flags[2] = 1;  // transport success
-        flags[3] = 1;  // eresult = k_EResultOK
+        flags[3] = result.eresult;
     }
 
     return 1;
 }
 
 // Hook: IsCloudEnabledForApp (CUserRemoteStorage vtable slot 24)
-//
 // 32-bit cdecl: bool(void* this, unsigned int appId)
-// Steam calls this to determine if cloud sync UI should be shown.
-// We return true for namespace apps to make the cloud toggle sticky.
+// Returns true for namespace apps so cloud toggle stays enabled.
 
 using IsCloudEnabledForApp_t = bool(*)(void* pThis, unsigned int appId);
 static std::atomic<IsCloudEnabledForApp_t> g_origIsCloudEnabledForApp{nullptr};
@@ -566,6 +598,11 @@ void CloudHooks::SetOriginalIsCloudEnabled(void* orig) {
 
 extern "C" bool hook_IsCloudEnabledForApp(void* pThis, unsigned int appId)
 {
+    HookGuard guard;
+    if (g_shuttingDown.load(std::memory_order_acquire)) {
+        auto fn = g_origIsCloudEnabledForApp.load(std::memory_order_acquire);
+        return fn ? fn(pThis, appId) : true;
+    }
     CrashContextScope crashContext("IsCloudEnabledForApp:entry", "IsCloudEnabledForApp", appId);
     if (CloudIntercept::IsNamespaceApp(appId)) {
         LOG("[Hook] IsCloudEnabledForApp(%u) -> true (namespace app)", appId);
@@ -577,4 +614,10 @@ extern "C" bool hook_IsCloudEnabledForApp(void* pThis, unsigned int appId)
         return origFn(pThis, appId);
     }
     return true;
+}
+
+void CloudHooks::BeginShutdown() {
+    g_shuttingDown.store(true, std::memory_order_release);
+    for (int i = 0; i < 300 && g_hookRefCount.load(std::memory_order_acquire) > 0; ++i)
+        usleep(10000); // 10ms, up to 3s total
 }

@@ -5,12 +5,8 @@
 #include <cstring>
 #include <cinttypes>
 #include <mutex>
-#include <dlfcn.h>
-#include <link.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <signal.h>
-#include <setjmp.h>
 #include <fcntl.h>
 
 // RTTI typestring for CClientUnifiedServiceTransport (Itanium ABI mangled)
@@ -23,6 +19,32 @@ static int g_readableCount = 0;
 static struct { uintptr_t start; uintptr_t end; } g_writableRanges[64];
 static int g_writableCount = 0;
 
+// Probe readability via write() to /dev/null. Used before g_readableRanges is populated.
+static bool CanReadMemory(const void* addr, size_t len);
+
+// Walk backward page-by-page to find ELF magic (true load base).
+// Labeled-min may be offset into the file due to split PT_LOAD mappings.
+static uintptr_t FindElfBaseBackward(uintptr_t hint)
+{
+    const long pageSize = sysconf(_SC_PAGESIZE);
+    const uintptr_t pageMask = ~(uintptr_t)(pageSize - 1);
+    uintptr_t page = hint & pageMask;
+    // Cap at 64 MiB backward to avoid sweeping into adjacent modules.
+    const uintptr_t limit = (page > (64ULL * 1024 * 1024)) ? page - (64ULL * 1024 * 1024) : 0;
+    while (page >= limit && page != 0)
+    {
+        if (CanReadMemory(reinterpret_cast<void*>(page), 4))
+        {
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(page);
+            if (p[0] == 0x7F && p[1] == 'E' && p[2] == 'L' && p[3] == 'F')
+                return page;
+        }
+        if (page < (uintptr_t)pageSize) break;
+        page -= pageSize;
+    }
+    return 0;
+}
+
 uintptr_t VtableHook::FindSteamclient(size_t& outSize)
 {
     FILE* f = fopen("/proc/self/maps", "r");
@@ -32,16 +54,12 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
         return 0;
     }
 
-    // Two-pass scan: first find steamclient.so's address span from labeled
-    // lines, then capture ALL readable/writable pages in that span (including
-    // anonymous gap pages that hold .data.rel.ro / vtables).
-    uintptr_t base = 0;
-    uintptr_t end  = 0;
+    uintptr_t labeledMin = 0;
+    uintptr_t labeledMax = 0;
     g_readableCount = 0;
     g_writableCount = 0;
     char line[512];
 
-    // Pass 1: find base/end from lines labeled steamclient.so
     while (fgets(line, sizeof(line), f))
     {
         uintptr_t start_addr, end_addr;
@@ -49,21 +67,41 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
             continue;
         if (strstr(line, "steamclient.so"))
         {
-            if (base == 0 || start_addr < base)
-                base = start_addr;
-            if (end_addr > end)
-                end = end_addr;
+            if (labeledMin == 0 || start_addr < labeledMin)
+                labeledMin = start_addr;
+            if (end_addr > labeledMax)
+                labeledMax = end_addr;
         }
     }
 
-    if (base == 0)
+    if (labeledMin == 0)
     {
         fclose(f);
         Log::Error("steamclient.so not found in /proc/self/maps");
         return 0;
     }
 
-    // Pass 2: capture all readable/writable pages within the span
+    // Anchor base on ELF magic to correct for labeled-min offset.
+    uintptr_t base = FindElfBaseBackward(labeledMin);
+    if (base == 0)
+    {
+        Log::Warn("ELF magic not found backward from labeled steamclient.so start %p, using labeled min",
+                  (void*)labeledMin);
+        base = labeledMin;
+    }
+    else if (base != labeledMin)
+    {
+        Log::Info("corrected steamclient.so base from labeled %p to ELF-magic %p (gap=0x%zx)",
+                  (void*)labeledMin, (void*)base, labeledMin - base);
+    }
+
+    // Capture readable mappings within +/-16 MiB of labeled span.
+    // .data.rel.ro may be in anonymous mappings outside the labeled range.
+    // Slot-pointer validation still uses the tight labeled span.
+    const uintptr_t adjacency = 16ULL * 1024 * 1024;
+    const uintptr_t scanLo = (base > adjacency) ? base - adjacency : 0;
+    const uintptr_t scanHi = labeledMax + adjacency;
+
     rewind(f);
     while (fgets(line, sizeof(line), f))
     {
@@ -72,44 +110,32 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
         if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &start_addr, &end_addr, perms) < 3)
             continue;
 
-        if (start_addr >= base && end_addr <= end)
+        if (end_addr <= scanLo || start_addr >= scanHi) continue;
+
+        if (perms[0] == 'r' && g_readableCount < 64)
         {
-            if (perms[0] == 'r' && g_readableCount < 64)
-            {
-                g_readableRanges[g_readableCount].start = start_addr;
-                g_readableRanges[g_readableCount].end = end_addr;
-                g_readableCount++;
-            }
-            if (perms[0] == 'r' && perms[1] == 'w' && g_writableCount < 64)
-            {
-                g_writableRanges[g_writableCount].start = start_addr;
-                g_writableRanges[g_writableCount].end = end_addr;
-                g_writableCount++;
-            }
+            g_readableRanges[g_readableCount].start = start_addr;
+            g_readableRanges[g_readableCount].end = end_addr;
+            g_readableCount++;
+        }
+        if (perms[0] == 'r' && perms[1] == 'w' && g_writableCount < 64)
+        {
+            g_writableRanges[g_writableCount].start = start_addr;
+            g_writableRanges[g_writableCount].end = end_addr;
+            g_writableCount++;
         }
     }
     fclose(f);
 
-    outSize = end - base;
+    outSize = labeledMax - base;
     Log::Info("steamclient.so base=%p end=%p size=0x%zx (%d readable, %d writable ranges)", 
-              (void*)base, (void*)end, outSize, g_readableCount, g_writableCount);
+              (void*)base, (void*)labeledMax, outSize, g_readableCount, g_writableCount);
+    Log::Debug("labeledMin=%p labeledMax=%p scanWindow=[%p, %p]",
+               (void*)labeledMin, (void*)labeledMax, (void*)scanLo, (void*)scanHi);
     return base;
 }
 
-// Helper: check if an address range is within a readable mapping
-static bool IsReadable(uintptr_t addr, size_t len)
-{
-    uintptr_t addrEnd = addr + len;
-    if (addrEnd < addr) return false;  // overflow on 32-bit
-    for (int i = 0; i < g_readableCount; i++)
-    {
-        if (addr >= g_readableRanges[i].start && addrEnd <= g_readableRanges[i].end)
-            return true;
-    }
-    return false;
-}
-
-// Safe memory probe using write() to /dev/null — avoids SIGSEGV
+// Safe memory probe using write() to /dev/null -- avoids SIGSEGV
 static bool CanReadMemory(const void* addr, size_t len)
 {
     static std::once_flag devnullOnce;
@@ -122,136 +148,157 @@ static bool CanReadMemory(const void* addr, size_t len)
     return (write(devnull, addr, len) == (ssize_t)len);
 }
 
+// Scan readable ranges within steamclient for a byte sequence.
+static const uint8_t* FindBytes(const void* needle, size_t needleLen,
+                                uintptr_t steamBase, size_t steamSize)
+{
+    for (int r = 0; r < g_readableCount; r++)
+    {
+        if (g_readableRanges[r].end <= steamBase ||
+            g_readableRanges[r].start >= steamBase + steamSize)
+            continue;
+        size_t rangeSize = g_readableRanges[r].end - g_readableRanges[r].start;
+        if (rangeSize < needleLen) continue;
+
+        const uint8_t* rStart = reinterpret_cast<const uint8_t*>(g_readableRanges[r].start);
+        const uint8_t* rEnd = reinterpret_cast<const uint8_t*>(g_readableRanges[r].end);
+        for (const uint8_t* p = rStart; p <= rEnd - needleLen; p++)
+        {
+            if (memcmp(p, needle, needleLen) == 0)
+                return p;
+        }
+    }
+    return nullptr;
+}
+
+// Search steamclient ranges for a pointer value; tries `primary` first,
+// falls back to `fallback` to avoid false positives on small values.
+static const uintptr_t* FindPointerValue(uintptr_t primary, uintptr_t fallback,
+                                         uintptr_t steamBase, size_t steamSize)
+{
+    for (int pass = 0; pass < 2; pass++)
+    {
+        uintptr_t target = (pass == 0) ? primary : fallback;
+        if (pass == 1 && primary == fallback) break;  // same value, no second pass
+
+        for (int r = 0; r < g_readableCount; r++)
+        {
+            if (g_readableRanges[r].end <= steamBase ||
+                g_readableRanges[r].start >= steamBase + steamSize)
+                continue;
+
+            const uintptr_t* scanStart = reinterpret_cast<const uintptr_t*>(
+                (g_readableRanges[r].start + sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1));
+            const uintptr_t* scanEnd = reinterpret_cast<const uintptr_t*>(
+                g_readableRanges[r].end & ~(sizeof(uintptr_t) - 1));
+
+            for (const uintptr_t* p = scanStart; p < scanEnd; p++)
+            {
+                if (*p == target)
+                    return p;
+            }
+        }
+    }
+    return nullptr;
+}
+
 void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
 {
     const size_t nameLen = strlen(RTTI_NAME);
 
-    // Scan rw- pages (.data.rel.ro) for vtable pointer references.
-
-    // Find the RTTI typestring in readable ranges
-    const uint8_t* rttiStr = nullptr;
-    for (int r = 0; r < g_readableCount && !rttiStr; r++)
-    {
-        // Only scan smaller ranges likely to be .rodata (skip huge .text)
-        size_t rangeSize = g_readableRanges[r].end - g_readableRanges[r].start;
-        if (rangeSize < nameLen) continue;
-
-        const uint8_t* rStart = reinterpret_cast<const uint8_t*>(g_readableRanges[r].start);
-        const uint8_t* rEnd = reinterpret_cast<const uint8_t*>(g_readableRanges[r].end);
-
-        for (const uint8_t* p = rStart; p < rEnd - nameLen; p++)
-        {
-            if (memcmp(p, RTTI_NAME, nameLen + 1) == 0)
-            {
-                rttiStr = p;
-                break;
-            }
-        }
-    }
-
+    // Find RTTI string in .rodata (never relocated)
+    const uint8_t* rttiStr = FindBytes(RTTI_NAME, nameLen + 1, steamBase, steamSize);
     if (!rttiStr)
     {
         Log::Error("RTTI string '%s' not found in steamclient.so", RTTI_NAME);
         return nullptr;
     }
     uintptr_t rttiStrAddr = reinterpret_cast<uintptr_t>(rttiStr);
-    Log::Debug("RTTI typestring at %p (offset 0x%zx)", rttiStr, rttiStrAddr - steamBase);
+    uintptr_t rttiStrVaddr = rttiStrAddr - steamBase;  // file vaddr (pre-relocation value)
+    Log::Debug("RTTI typestring at %p (vaddr 0x%zx)", rttiStr, (size_t)rttiStrVaddr);
 
-    // Itanium ABI: vtable is at fixed offset from RTTI typestring.
-
-    // Known offset from RTTI string to vtable function pointers
-    static const uintptr_t KNOWN_VTABLE_OFFSETS[] = {
-        0x227F450,  // ubuntu12_32/steamclient.so (May 12 2026 - latest)
-        0x227F490,  // ubuntu12_32/steamclient.so (new Steam Runtime, May 2026)
-        0x227C510,  // ubuntu12_32/steamclient.so (old Steam Runtime)
-        0x2246E50,  // linux32/steamclient.so build May 2026
-        0x2245E70,  // linux32/steamclient.so build Apr 2026
-    };
-
-    for (size_t i = 0; i < sizeof(KNOWN_VTABLE_OFFSETS)/sizeof(KNOWN_VTABLE_OFFSETS[0]); i++)
+    // Find typeinfo: name_ptr is raw vaddr (unrelocated) or absolute (relocated)
+    const uintptr_t* nameField = FindPointerValue(rttiStrAddr, rttiStrVaddr,
+                                                  steamBase, steamSize);
+    if (!nameField)
     {
-        uintptr_t candidateVtable = rttiStrAddr + KNOWN_VTABLE_OFFSETS[i];
-        if (!IsReadable(candidateVtable, 44)) continue;
-
-        void** vt = reinterpret_cast<void**>(candidateVtable);
-        // Sanity: slots 5, 7, 8 (the ones we hook) should be code pointers within steamclient
-        uintptr_t slot5 = reinterpret_cast<uintptr_t>(vt[5]);
-        uintptr_t slot7 = reinterpret_cast<uintptr_t>(vt[7]);
-        uintptr_t slot8 = reinterpret_cast<uintptr_t>(vt[8]);
-        if (slot5 >= steamBase && slot5 < steamBase + steamSize &&
-            slot7 >= steamBase && slot7 < steamBase + steamSize &&
-            slot8 >= steamBase && slot8 < steamBase + steamSize)
-        {
-            Log::Info("CClientUnifiedServiceTransport vtable at %p (offset 0x%zx, method=offset[%zu])",
-                      vt, candidateVtable - steamBase, i);
-            Log::Debug("  slot5=%p  slot7=%p  slot8=%p", vt[5], vt[7], vt[8]);
-            return vt;
-        }
-    }
-
-    // Fallback: pointer scan of ALL readable ranges (typeinfo may be in .rodata)
-    Log::Debug("Offset-based lookup failed, trying pointer scan of %d readable ranges...", g_readableCount);
-    const uintptr_t* typeinfoPtr = nullptr;
-    for (int r = 0; r < g_readableCount && !typeinfoPtr; r++)
-    {
-        const uintptr_t* scanStart = reinterpret_cast<const uintptr_t*>(
-            (g_readableRanges[r].start + sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1));
-        const uintptr_t* scanEnd = reinterpret_cast<const uintptr_t*>(
-            g_readableRanges[r].end & ~(sizeof(uintptr_t) - 1));
-
-        for (const uintptr_t* p = scanStart; p < scanEnd; p++)
-        {
-            if (*p == rttiStrAddr)
-            {
-                typeinfoPtr = p - 1;
-                Log::Debug("Found RTTI pointer at %p in range %d", p, r);
-                break;
-            }
-        }
-    }
-
-    if (!typeinfoPtr)
-    {
-        Log::Error("typeinfo struct not found for CClientUnifiedServiceTransport");
+        Log::Error("typeinfo for CClientUnifiedServiceTransport not found");
+        Log::Debug("  searched for 0x%zx (relocated) and 0x%zx (unrelocated) across %d ranges",
+                   (size_t)rttiStrAddr, (size_t)rttiStrVaddr, g_readableCount);
         return nullptr;
     }
-    uintptr_t typeinfoAddr = reinterpret_cast<uintptr_t>(typeinfoPtr);
-    Log::Debug("typeinfo at %p (offset 0x%zx)", typeinfoPtr, typeinfoAddr - steamBase);
+    const uintptr_t* typeinfo = nameField - 1;  // typeinfo starts one slot before name
+    uintptr_t typeinfoAddr = reinterpret_cast<uintptr_t>(typeinfo);
+    bool relocated = (*nameField == rttiStrAddr);
+    Log::Debug("typeinfo at %p (vaddr 0x%zx, %s)",
+               typeinfo, typeinfoAddr - steamBase, relocated ? "relocated" : "unrelocated");
 
-        // Find vtable in readable ranges
+    // Poll until .data.rel.ro relocations are applied
+    if (!relocated)
+    {
+        Log::Info("Relocations pending for .data.rel.ro, waiting...");
+        volatile uintptr_t* nameSlot = const_cast<volatile uintptr_t*>(nameField);
+        int waitMs = 0;
+        const int maxWaitMs = 30000;  // 30 seconds max
+        while (*nameSlot != rttiStrAddr && waitMs < maxWaitMs)
+        {
+            usleep(50000);  // 50ms
+            waitMs += 50;
+        }
+        if (*nameSlot != rttiStrAddr)
+        {
+            Log::Error("Relocations did not complete after %dms (name_ptr=%p, expected %p)",
+                       waitMs, (void*)*nameSlot, (void*)rttiStrAddr);
+            return nullptr;
+        }
+        Log::Info("Relocations completed after %dms", waitMs);
+    }
+
+    // Find vtable: scan for [offset_to_top=0, typeinfo_ptr] header
     void** vtableFuncs = nullptr;
     for (int r = 0; r < g_readableCount && !vtableFuncs; r++)
     {
+        if (g_readableRanges[r].end <= steamBase ||
+            g_readableRanges[r].start >= steamBase + steamSize)
+            continue;
+
         const uintptr_t* scanStart = reinterpret_cast<const uintptr_t*>(
             (g_readableRanges[r].start + sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1));
         const uintptr_t* scanEnd = reinterpret_cast<const uintptr_t*>(
             g_readableRanges[r].end & ~(sizeof(uintptr_t) - 1));
 
-        for (const uintptr_t* p = scanStart; p < scanEnd; p++)
+        for (const uintptr_t* p = scanStart; p + 1 < scanEnd; p++)
         {
-            if (*p == typeinfoAddr)
+            if (*p == 0 && *(p + 1) == typeinfoAddr)
             {
-                if (p > scanStart && *(p - 1) == 0)
-                {
-                    vtableFuncs = reinterpret_cast<void**>(const_cast<uintptr_t*>(p + 1));
-                    Log::Debug("Found vtable pointer at %p in range %d", p, r);
-                    break;
-                }
+                vtableFuncs = reinterpret_cast<void**>(const_cast<uintptr_t*>(p + 2));
+                Log::Debug("Found vtable at %p (header at %p) in range %d",
+                           vtableFuncs, p, r);
+                break;
             }
         }
     }
 
     if (!vtableFuncs)
     {
-        Log::Error("vtable for CClientUnifiedServiceTransport not found");
+        Log::Error("vtable for CClientUnifiedServiceTransport not found (typeinfo=%p)", typeinfo);
         return nullptr;
     }
 
-    // Verify slots 0-8 are readable before accessing
-    if (!IsReadable(reinterpret_cast<uintptr_t>(vtableFuncs), 9 * sizeof(void*)))
+    // Validate function pointer slots
+    if (!CanReadMemory(vtableFuncs, 9 * sizeof(void*)))
     {
-        Log::Error("CClientUnifiedServiceTransport vtable at %p but slots 0-8 not readable", vtableFuncs);
+        Log::Error("CClientUnifiedServiceTransport vtable at %p but slots not readable", vtableFuncs);
         return nullptr;
+    }
+
+    for (int slot : {5, 7, 8}) {
+        uintptr_t fn = reinterpret_cast<uintptr_t>(vtableFuncs[slot]);
+        if (fn < steamBase || fn >= steamBase + steamSize) {
+            Log::Error("vtable slot %d (%p) outside steamclient range [%p, %p)",
+                       slot, (void*)fn, (void*)steamBase, (void*)(steamBase + steamSize));
+            return nullptr;
+        }
     }
 
     Log::Info("CClientUnifiedServiceTransport vtable at %p (offset 0x%zx)",
@@ -294,7 +341,7 @@ bool VtableHook::InstallHooks(void** vtable, VtableInfo& info)
     info.origSlot7 = vtable[7];
     info.origSlot8 = vtable[8];
 
-    // The vtable lives in .data.rel.ro — need to make it writable
+    // The vtable lives in .data.rel.ro -- need to make it writable
     void* slotBase = &vtable[5];
     size_t span = reinterpret_cast<uintptr_t>(&vtable[8]) - reinterpret_cast<uintptr_t>(&vtable[5]) + 8;
 
@@ -347,7 +394,7 @@ static bool IsWithinSteamclient(uintptr_t ptr, uintptr_t steamBase, size_t steam
 static bool IsLikelyAppCloudEnabledSlot(void** vtable, size_t slotIndex, uintptr_t steamBase, size_t steamSize)
 {
     uintptr_t fn = reinterpret_cast<uintptr_t>(vtable[slotIndex]);
-    if (!IsWithinSteamclient(fn, steamBase, steamSize) || !IsReadable(fn, 30))
+    if (!IsWithinSteamclient(fn, steamBase, steamSize) || !CanReadMemory(reinterpret_cast<void*>(fn), 30))
         return false;
 
     const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
@@ -397,110 +444,48 @@ void** VtableHook::FindRemoteStorageVtable(uintptr_t steamBase, size_t steamSize
 {
     const size_t nameLen = strlen(RTTI_REMOTE_STORAGE);
 
-    // Find RTTI string in readable ranges
-    const uint8_t* rttiStr = nullptr;
-    for (int r = 0; r < g_readableCount && !rttiStr; r++)
-    {
-        const uint8_t* rStart = reinterpret_cast<const uint8_t*>(g_readableRanges[r].start);
-        const uint8_t* rEnd = reinterpret_cast<const uint8_t*>(g_readableRanges[r].end);
-        if ((size_t)(rEnd - rStart) <= nameLen) continue;
-
-        for (const uint8_t* p = rStart; p < rEnd - nameLen; p++)
-        {
-            if (memcmp(p, RTTI_REMOTE_STORAGE, nameLen + 1) == 0)
-            {
-                rttiStr = p;
-                break;
-            }
-        }
-    }
-
+    // Find RTTI string
+    const uint8_t* rttiStr = FindBytes(RTTI_REMOTE_STORAGE, nameLen + 1, steamBase, steamSize);
     if (!rttiStr)
     {
         Log::Error("RTTI string '%s' not found in steamclient.so", RTTI_REMOTE_STORAGE);
         return nullptr;
     }
     uintptr_t rttiStrAddr = reinterpret_cast<uintptr_t>(rttiStr);
-    Log::Debug("CUserRemoteStorage RTTI typestring at %p (offset 0x%zx)", rttiStr, rttiStrAddr - steamBase);
+    uintptr_t rttiStrVaddr = rttiStrAddr - steamBase;
+    Log::Debug("CUserRemoteStorage RTTI at %p (vaddr 0x%zx)", rttiStr, (size_t)rttiStrVaddr);
 
-    // Try offset-based lookup first (fast, crash-safe)
-    static const uintptr_t KNOWN_STORAGE_OFFSETS[] = {
-        0x224AF00,  // ubuntu12_32/steamclient.so (May 12 2026 - latest)
-        0x224AF40,  // ubuntu12_32/steamclient.so (new Steam Runtime, May 2026)
-        0x2247FA0,  // ubuntu12_32/steamclient.so (old Steam Runtime)
-        0x221C280,  // linux32/steamclient.so build May 2026
-        0x221B2A0,  // linux32/steamclient.so build Apr 2026
-    };
-
-    for (size_t i = 0; i < sizeof(KNOWN_STORAGE_OFFSETS)/sizeof(KNOWN_STORAGE_OFFSETS[0]); i++)
+    // Find typeinfo (relocations already waited on by Transport)
+    const uintptr_t* nameField = FindPointerValue(rttiStrAddr, rttiStrVaddr,
+                                                  steamBase, steamSize);
+    if (!nameField)
     {
-        uintptr_t candidateVtable = rttiStrAddr + KNOWN_STORAGE_OFFSETS[i];
-        if (!IsReadable(candidateVtable, 25 * sizeof(void*))) continue;
-
-        void** vt = reinterpret_cast<void**>(candidateVtable);
-        // Find the IsCloudEnabledForApp slot first, then validate it
-        size_t cloudEnabledSlot = ResolveCloudEnabledSlot(vt, steamBase, steamSize);
-        if (cloudEnabledSlot == SIZE_MAX)
-            continue;
-        
-        uintptr_t slotAddr = reinterpret_cast<uintptr_t>(vt[cloudEnabledSlot]);
-        if (slotAddr >= steamBase && slotAddr < steamBase + steamSize)
-        {
-            Log::Info("CUserRemoteStorage vtable at %p (offset 0x%zx, method=offset[%zu])",
-                      vt, candidateVtable - steamBase, i);
-            Log::Debug("  cloud-enabled slot%zu=%p", cloudEnabledSlot, vt[cloudEnabledSlot]);
-            return vt;
-        }
-    }
-
-    // Fallback: pointer scan
-    Log::Debug("Offset-based lookup failed for CUserRemoteStorage, trying pointer scan...");
-
-    // Find typeinfo referencing string
-    const uintptr_t* typeinfoPtr = nullptr;
-    for (int r = 0; r < g_readableCount && !typeinfoPtr; r++)
-    {
-        const uintptr_t* scanStart = reinterpret_cast<const uintptr_t*>(
-            (g_readableRanges[r].start + sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1));
-        const uintptr_t* scanEnd = reinterpret_cast<const uintptr_t*>(
-            g_readableRanges[r].end & ~(sizeof(uintptr_t) - 1));
-
-        for (const uintptr_t* p = scanStart; p < scanEnd; p++)
-        {
-            if (*p == rttiStrAddr)
-            {
-                typeinfoPtr = p - 1;
-                break;
-            }
-        }
-    }
-
-    if (!typeinfoPtr)
-    {
-        Log::Error("typeinfo struct not found for CUserRemoteStorage");
+        Log::Error("typeinfo for CUserRemoteStorage not found");
         return nullptr;
     }
-    uintptr_t typeinfoAddr = reinterpret_cast<uintptr_t>(typeinfoPtr);
-    Log::Debug("CUserRemoteStorage typeinfo at %p", typeinfoPtr);
+    const uintptr_t* typeinfo = nameField - 1;
+    uintptr_t typeinfoAddr = reinterpret_cast<uintptr_t>(typeinfo);
+    Log::Debug("CUserRemoteStorage typeinfo at %p", typeinfo);
 
-    // Find vtable referencing typeinfo
+    // Find vtable: [offset_to_top=0, typeinfo_ptr]
     void** vtableFuncs = nullptr;
     for (int r = 0; r < g_readableCount && !vtableFuncs; r++)
     {
+        if (g_readableRanges[r].end <= steamBase ||
+            g_readableRanges[r].start >= steamBase + steamSize)
+            continue;
+
         const uintptr_t* scanStart = reinterpret_cast<const uintptr_t*>(
             (g_readableRanges[r].start + sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1));
         const uintptr_t* scanEnd = reinterpret_cast<const uintptr_t*>(
             g_readableRanges[r].end & ~(sizeof(uintptr_t) - 1));
 
-        for (const uintptr_t* p = scanStart; p < scanEnd; p++)
+        for (const uintptr_t* p = scanStart; p + 1 < scanEnd; p++)
         {
-            if (*p == typeinfoAddr)
+            if (*p == 0 && *(p + 1) == typeinfoAddr)
             {
-                if (p > scanStart && *(p - 1) == 0)
-                {
-                    vtableFuncs = reinterpret_cast<void**>(const_cast<uintptr_t*>(p + 1));
-                    break;
-                }
+                vtableFuncs = reinterpret_cast<void**>(const_cast<uintptr_t*>(p + 2));
+                break;
             }
         }
     }
@@ -511,9 +496,9 @@ void** VtableHook::FindRemoteStorageVtable(uintptr_t steamBase, size_t steamSize
         return nullptr;
     }
 
-    if (!IsReadable(reinterpret_cast<uintptr_t>(vtableFuncs), 25 * sizeof(void*)))
+    if (!CanReadMemory(vtableFuncs, 25 * sizeof(void*)))
     {
-        Log::Error("CUserRemoteStorage vtable at %p but candidate slots are not readable", vtableFuncs);
+        Log::Error("CUserRemoteStorage vtable at %p but slots not readable", vtableFuncs);
         return nullptr;
     }
 

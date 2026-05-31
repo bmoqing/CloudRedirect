@@ -1,11 +1,14 @@
 #include "autocloud_bootstrap.h"
 #include "autocloud_scan.h"
+#include "app_state.h"
+#include "batch_tracker.h"
 #include "cloud_intercept.h"
 #include "cloud_storage.h"
+#include "cloud_work_queue.h"
 #include "file_util.h"
 #include "local_storage.h"
-#include "local_metadata_store.h"
 #include "log.h"
+#include "pending_ops_journal.h"
 
 #include <algorithm>
 #include <atomic>
@@ -20,9 +23,7 @@
 
 namespace AutoCloudBootstrap {
 
-// ============================================================================
 // Internal state
-// ============================================================================
 
 // g_importMutex > g_tokenCacheMutex > g_bootstrapMutex. Network/disk I/O runs unlocked.
 static std::mutex g_tokenCacheMutex;
@@ -39,12 +40,13 @@ static std::vector<std::future<void>> g_futures;
 static bool g_shuttingDown = false;
 // Live orchestrator frames; shutdown waits on this + active.empty().
 static int g_orchestratorCount = 0;
+// Cap concurrent bootstrap workers to avoid OOM on large libraries.
+static constexpr int kMaxConcurrentBootstraps = 8;
+static std::atomic<int> g_activeWorkerCount{0};
 
 static constexpr uint64_t kMaxImportBytes = 128ULL * 1024 * 1024;
 
-// ============================================================================
 // Helpers
-// ============================================================================
 
 static uint64_t MakeAppKey(uint32_t accountId, uint32_t appId) {
     return CloudIntercept::MakeAppAccountKey(accountId, appId);
@@ -98,9 +100,7 @@ static std::vector<uint8_t> ReadWholeFile(const std::string& path, bool& ok) {
     return data;
 }
 
-// ============================================================================
 // Token cache management
-// ============================================================================
 
 static void CacheCanonicalTokens(uint32_t accountId, uint32_t appId,
                                  const std::vector<AutoCloudScan::FileEntry>& candidates,
@@ -127,9 +127,7 @@ static uint64_t GetTokenGeneration(uint32_t accountId, uint32_t appId) {
     return g_canonicalTokenGeneration[MakeAppKey(accountId, appId)];
 }
 
-// ============================================================================
 // Bootstrap lifecycle
-// ============================================================================
 
 static bool TryBeginBootstrap(uint32_t accountId, uint32_t appId) {
     uint64_t appKey = MakeAppKey(accountId, appId);
@@ -153,17 +151,12 @@ static bool TryBeginBootstrap(uint32_t accountId, uint32_t appId) {
 }
 
 static void FinishBootstrap(uint32_t accountId, uint32_t appId,
-                            bool markAttempted, uint64_t generation) {
+                            bool markAttempted, uint64_t /*generation*/) {
     uint64_t appKey = MakeAppKey(accountId, appId);
-    uint64_t curGen;
-    {
-        std::lock_guard<std::mutex> tokenLock(g_tokenCacheMutex);
-        curGen = g_canonicalTokenGeneration[appKey];
-    }
     std::lock_guard<std::mutex> lock(g_bootstrapMutex);
-    bool generationCurrent = (curGen == generation);
     g_activeApps.erase(appKey);
-    if (markAttempted && generationCurrent) g_attemptedApps.insert(appKey);
+    // Mark unconditionally to prevent re-import loops.
+    if (markAttempted) g_attemptedApps.insert(appKey);
     g_bootstrapCV.notify_all();
 }
 
@@ -185,9 +178,7 @@ static bool IsShuttingDownInternal() {
     return g_shuttingDown;
 }
 
-// ============================================================================
 // Worker implementation
-// ============================================================================
 
 static void BootstrapWorker(uint32_t accountId, uint32_t appId, uint64_t cacheGeneration) {
     struct FinishGuard {
@@ -212,6 +203,13 @@ static void BootstrapWorker(uint32_t accountId, uint32_t appId, uint64_t cacheGe
     if (IsShuttingDownInternal()) {
         LOG("[AutoCloudImport] Aborting bootstrap for app %u -- shutdown in progress", appId);
         ClearCanonicalTokens(accountId, appId, cacheGeneration);
+        finish(false, cacheGeneration);
+        return;
+    }
+
+    // Defer import while upload is pending (blobs may not be on provider).
+    if (PendingOpsJournal::HasPendingUpload(accountId, appId)) {
+        LOG("[AutoCloudImport] Pending upload exists for app %u; deferring import", appId);
         finish(false, cacheGeneration);
         return;
     }
@@ -277,7 +275,6 @@ static void BootstrapWorker(uint32_t accountId, uint32_t appId, uint64_t cacheGe
 
     auto fileTokens = CloudStorage::LoadFileTokens(accountId, appId);
     auto rootTokens = CloudStorage::LoadRootTokens(accountId, appId);
-    auto tombstoneSnapshot = LocalMetadataStore::LoadDeleted(accountId, appId);
     std::unordered_set<std::string> remoteBlobNames;
     if (!CloudStorage::ListRemoteBlobNames(accountId, appId, remoteBlobNames)) {
         LOG("[AutoCloudImport] Aborting import for app %u: could not list remote blobs",
@@ -359,11 +356,6 @@ static void BootstrapWorker(uint32_t accountId, uint32_t appId, uint64_t cacheGe
                     appId, fe.relativePath.c_str());
                 continue;
             }
-            if (tombstoneSnapshot.count(fe.relativePath) > 0) {
-                LOG("[AutoCloudImport] Skipping app %u file %s because it has a delete tombstone",
-                    appId, fe.relativePath.c_str());
-                continue;
-            }
         }
 
         pendingImports.push_back({ fe.relativePath, fe.fullPath, fe.modifiedTime, fe.rootToken, isRefresh, fe.sha });
@@ -410,11 +402,6 @@ static void BootstrapWorker(uint32_t accountId, uint32_t appId, uint64_t cacheGe
         if (IsShuttingDownInternal()) {
             LOG("[AutoCloudImport] Aborting mid-import for app %u -- shutdown in progress", appId);
             break;
-        }
-        if (LocalMetadataStore::IsDeleted(accountId, appId, pending.filename)) {
-            LOG("[AutoCloudImport] Skipping app %u file %s because tombstone appeared before commit",
-                appId, pending.filename.c_str());
-            continue;
         }
         if (!pending.refresh && CloudStorage::HasLocalBlob(accountId, appId, pending.filename)) {
             LOG("[AutoCloudImport] Skipping app %u file %s because blob appeared before commit",
@@ -496,6 +483,26 @@ static void BootstrapWorker(uint32_t accountId, uint32_t appId, uint64_t cacheGe
         return;
     }
 
+    // Drain blob uploads before publishing state -- don't advertise un-uploaded blobs.
+    if (!CloudWorkQueue::DrainQueueForApp(accountId, appId)) {
+        LOG("[AutoCloudImport] Blob drain FAILED for app %u; aborting commit", appId);
+        ClearCanonicalTokens(accountId, appId, publishGeneration);
+        finish(false, publishGeneration);
+        return;
+    }
+
+    // Abort if batch in progress -- CompleteBatch owns CN/state publish.
+    if (CloudIntercept::BatchTracker_ActiveId(accountId, appId) != 0) {
+        LOG("[AutoCloudImport] Active batch detected for app %u; deferring import", appId);
+        ClearCanonicalTokens(accountId, appId, publishGeneration);
+        finish(false, publishGeneration);
+        return;
+    }
+
+    // Sync mutex: serialize CN increment + state publish.
+    auto syncMtx = CloudStorage::AcquireAppSyncMutex(accountId, appId);
+    std::lock_guard<std::mutex> syncLock(*syncMtx);
+
     uint64_t oldCN = LocalStorage::GetChangeNumber(accountId, appId);
     cn = LocalStorage::IncrementChangeNumber(accountId, appId);
     if (cn <= oldCN) {
@@ -504,7 +511,20 @@ static void BootstrapWorker(uint32_t accountId, uint32_t appId, uint64_t cacheGe
         finish(false, publishGeneration);
         return;
     }
-    CloudStorage::CommitCNWithRetry(accountId, appId, cn);
+    // Publish unified state (CN + manifest atomically)
+    {
+        CloudStorage::CloudAppState state;
+        state.cn = cn;
+        auto localManifest = CloudStorage::LoadLocalManifest(accountId, appId);
+        for (const auto& [name, me] : localManifest) {
+            CloudStorage::FileEntry fe;
+            fe.sha = me.sha;
+            fe.timestamp = me.timestamp;
+            fe.size = me.size;
+            state.files[name] = std::move(fe);
+        }
+        CloudStorage::PublishCloudState(accountId, appId, state);
+    }
 
     // Re-check generation; concurrent invalidation bumps it.
     if (GetTokenGeneration(accountId, appId) != publishGeneration) {
@@ -518,9 +538,7 @@ static void BootstrapWorker(uint32_t accountId, uint32_t appId, uint64_t cacheGe
     finish(true, publishGeneration);
 }
 
-// ============================================================================
 // Public API
-// ============================================================================
 
 void Bootstrap(uint32_t accountId, uint32_t appId, bool wait) {
     uint64_t cacheGeneration = GetTokenGeneration(accountId, appId);
@@ -552,13 +570,24 @@ void Bootstrap(uint32_t accountId, uint32_t appId, bool wait) {
         }
     } orchestratorGuard;
 
+    // Cap concurrent bootstrap workers to avoid OOM on large libraries.
+    if (g_activeWorkerCount.load(std::memory_order_relaxed) >= kMaxConcurrentBootstraps) {
+        LOG("[AutoCloudImport] Bootstrap deferred for app %u: %d/%d workers active",
+            appId, g_activeWorkerCount.load(), kMaxConcurrentBootstraps);
+        FinishBootstrap(accountId, appId, /*markAttempted=*/false, cacheGeneration);
+        return;
+    }
+
     // Spawn unlocked; thread creation can block 100s of ms on Windows.
     std::future<void> future;
     try {
+        g_activeWorkerCount.fetch_add(1, std::memory_order_relaxed);
         future = std::async(std::launch::async, [accountId, appId, cacheGeneration]() {
             BootstrapWorker(accountId, appId, cacheGeneration);
+            g_activeWorkerCount.fetch_sub(1, std::memory_order_relaxed);
         });
     } catch (...) {
+        g_activeWorkerCount.fetch_sub(1, std::memory_order_relaxed);
         LOG("[AutoCloudImport] Failed to spawn bootstrap worker for app %u", appId);
         FinishBootstrap(accountId, appId, /*markAttempted=*/false, cacheGeneration);
         return;
@@ -626,10 +655,7 @@ void InvalidateCache(uint32_t accountId, uint32_t appId) {
         g_canonicalTokenCache.erase(key);
         ++g_canonicalTokenGeneration[key];
     }
-    {
-        std::lock_guard<std::mutex> lock(g_bootstrapMutex);
-        g_attemptedApps.erase(key);
-    }
+    // Do NOT reset g_attemptedApps -- Steam imports once per process; resetting causes re-import loops.
 }
 
 void ResetAttempted(uint32_t accountId, uint32_t appId) {
@@ -638,7 +664,8 @@ void ResetAttempted(uint32_t accountId, uint32_t appId) {
 }
 
 int RestoreBlobsToGameFolder(uint32_t accountId, uint32_t appId,
-                              const std::string& steamPath) {
+                              const std::string& steamPath,
+                              const std::unordered_map<std::string, CloudStorage::FileEntry>* cloudFiles) {
     auto fileTokens = CloudStorage::LoadFileTokens(accountId, appId);
     if (fileTokens.empty()) {
         LOG("[AutoCloudRestore] app %u: no file tokens, skipping restore", appId);
@@ -657,15 +684,22 @@ int RestoreBlobsToGameFolder(uint32_t accountId, uint32_t appId,
         return 0;
     }
 
-    int restored = 0;
+    // Build list of files that need restoring (local checks only, no I/O).
+    struct RestoreJob {
+        std::string filename;
+        std::string targetPath;
+        uint64_t timestamp;
+        uint64_t rawSize;
+        std::string expectedShaHex; // from cloud state; empty if not available
+    };
+    std::vector<RestoreJob> jobs;
+
     for (const auto& fe : files) {
         if (fe.deleted) continue;
         if (CloudIntercept::IsInternalMetadataFile(fe.filename)) continue;
 
         auto tokenIt = fileTokens.find(fe.filename);
-        if (tokenIt == fileTokens.end() || tokenIt->second.empty()) {
-            continue;
-        }
+        if (tokenIt == fileTokens.end() || tokenIt->second.empty()) continue;
 
         auto dirIt = rootDirs.find(tokenIt->second);
         if (dirIt == rootDirs.end() || dirIt->second.empty()) {
@@ -697,9 +731,6 @@ int RestoreBlobsToGameFolder(uint32_t accountId, uint32_t appId,
             auto diskTime = std::filesystem::last_write_time(targetFsPath, ec);
             if (!ec) {
                 auto diskSeconds = AutoCloudUtil::FileTimeToUnixSeconds(diskTime);
-                // Skip restore only if disk file is newer AND non-empty.
-                // A zero-byte file (e.g., from a game crash mid-write) should
-                // not block restoration of a valid blob.
                 std::error_code sizeEc;
                 auto diskSize = std::filesystem::file_size(targetFsPath, sizeEc);
                 if (diskSeconds > fe.timestamp && !sizeEc && diskSize > 0) {
@@ -708,44 +739,91 @@ int RestoreBlobsToGameFolder(uint32_t accountId, uint32_t appId,
             }
         }
 
-        auto blobData = LocalStorage::ReadFile(accountId, appId, fe.filename);
-        if (blobData.empty() && fe.rawSize > 0) {
-            LOG("[AutoCloudRestore] app %u file %s: failed to read blob",
-                appId, fe.filename.c_str());
+        std::string shaHex;
+        if (cloudFiles) {
+            auto cit = cloudFiles->find(fe.filename);
+            if (cit != cloudFiles->end() && !cit->second.sha.empty()) {
+                const auto& sha = cit->second.sha;
+                static const char kHex[] = "0123456789abcdef";
+                shaHex.reserve(sha.size() * 2);
+                for (uint8_t b : sha) {
+                    shaHex += kHex[b >> 4];
+                    shaHex += kHex[b & 0xf];
+                }
+            }
+        }
+        jobs.push_back({fe.filename, std::move(targetPath), fe.timestamp, fe.rawSize, std::move(shaHex)});
+    }
+
+    if (jobs.empty()) return 0;
+
+    // Fetch blobs in parallel (up to 8 concurrent), then write sequentially.
+    constexpr size_t kMaxParallel = 8;
+    std::vector<std::vector<uint8_t>> blobResults(jobs.size());
+    size_t totalJobs = jobs.size();
+
+    for (size_t base = 0; base < totalJobs; base += kMaxParallel) {
+        size_t batchEnd = (std::min)(base + kMaxParallel, totalJobs);
+        std::vector<std::future<std::vector<uint8_t>>> futures;
+        futures.reserve(batchEnd - base);
+
+        for (size_t i = base; i < batchEnd; ++i) {
+            uint32_t acct = accountId;
+            uint32_t app = appId;
+            const std::string& fname = jobs[i].filename;
+            const std::string& fsha = jobs[i].expectedShaHex;
+            futures.push_back(std::async(std::launch::async,
+                [acct, app, &fname, &fsha]() {
+                    return CloudStorage::RetrieveBlob(acct, app, fname, nullptr, fsha);
+                }));
+        }
+
+        for (size_t i = 0; i < futures.size(); ++i) {
+            blobResults[base + i] = futures[i].get();
+        }
+    }
+
+    // Write to disk sequentially (filesystem ops are fast, atomicity matters).
+    int restored = 0;
+    for (size_t i = 0; i < totalJobs; ++i) {
+        auto& job = jobs[i];
+        auto& blobData = blobResults[i];
+
+        if (blobData.empty() && job.rawSize > 0) {
+            LOG("[AutoCloudRestore] app %u file %s: blob unavailable (local+cloud)",
+                appId, job.filename.c_str());
             continue;
         }
 
+        auto targetFsPath = FileUtil::Utf8ToPath(job.targetPath);
         auto parentDir = targetFsPath.parent_path();
         if (!parentDir.empty()) {
+            std::error_code ec;
             std::filesystem::create_directories(parentDir, ec);
             if (ec) {
                 LOG("[AutoCloudRestore] app %u file %s: failed to create directory %s: %s",
-                    appId, fe.filename.c_str(),
+                    appId, job.filename.c_str(),
                     FileUtil::PathToUtf8(parentDir).c_str(), ec.message().c_str());
                 continue;
             }
         }
 
-        // Use atomic write to minimize TOCTOU window
-        if (!FileUtil::AtomicWriteBinary(targetPath, blobData.data(), blobData.size())) {
+        if (!FileUtil::AtomicWriteBinary(job.targetPath, blobData.data(), blobData.size())) {
             LOG("[AutoCloudRestore] app %u file %s: failed to write: %s",
-                appId, fe.filename.c_str(), targetPath.c_str());
+                appId, job.filename.c_str(), job.targetPath.c_str());
             continue;
         }
 
-        if (fe.timestamp > 0) {
-            auto targetTime = AutoCloudUtil::UnixSecondsToFileTime(fe.timestamp);
+        if (job.timestamp > 0) {
+            std::error_code ec;
+            auto targetTime = AutoCloudUtil::UnixSecondsToFileTime(job.timestamp);
             std::filesystem::last_write_time(targetFsPath, targetTime, ec);
-            if (ec) {
-                LOG("[AutoCloudRestore] app %u file %s: failed to set mtime: %s",
-                    appId, fe.filename.c_str(), ec.message().c_str());
-            }
         }
 
         restored++;
         LOG("[AutoCloudRestore] app %u: restored %s -> %s (%zu bytes, ts=%llu)",
-            appId, fe.filename.c_str(), targetPath.c_str(),
-            blobData.size(), (unsigned long long)fe.timestamp);
+            appId, job.filename.c_str(), job.targetPath.c_str(),
+            blobData.size(), (unsigned long long)job.timestamp);
     }
 
     if (restored > 0) {

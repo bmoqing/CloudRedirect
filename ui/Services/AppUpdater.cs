@@ -100,8 +100,7 @@ internal static class AppUpdater
 
             if (!foundCandidate || remoteVersion == null) return null;
 
-            // Find the GUI .exe asset and its hash file. Match by exact name so the
-            // updater never accidentally grabs CloudRedirectCLI.exe (added in v2.0.8).
+            // Find the GUI exe asset and hash file (exact match to avoid grabbing the CLI exe)
             if (!root.TryGetProperty("assets", out var assets))
                 return null;
 

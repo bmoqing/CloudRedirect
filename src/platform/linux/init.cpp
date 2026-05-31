@@ -9,9 +9,13 @@
 extern "C" __attribute__((visibility("default")))
 const char* CR_GetVersion() { return CR_VERSION_STRING; }
 #include "cloud_hooks.h"
+#include "cloud_intercept.h"
 #include "cloud_storage.h"
 #include "http_server.h"
+#include "legacy_metadata_cleanup.h"
 #include "log.h"
+#include "rpc_handlers.h"
+#include "steam_kv_injector.h"
 
 #include <dlfcn.h>
 #include <unistd.h>
@@ -112,7 +116,7 @@ static void Notify(const char* msg, bool critical = false)
             execlp("notify-send", "notify-send", "-t", "5000", "-u", "normal", "CloudRedirect", msg, nullptr);
         _exit(1);
     }
-    // Parent: don't wait — reap asynchronously via SIGCHLD (default ignore)
+    // Parent: don't wait -- reap asynchronously via SIGCHLD (default ignore)
 }
 
 static std::string GetProcessName()
@@ -157,8 +161,8 @@ static void CleanLdPreload()
 
 static void DoInit()
 {
-    DebugLog("[CR] DoInit: version=" CR_VERSION_STRING " transport=external-curl finding steamclient.so in /proc/self/maps\n");
-    Log::Info("CloudRedirect build %s transport=external-curl", CR_VERSION_STRING);
+    DebugLog("[CR] DoInit: version=" CR_VERSION_STRING " 1779918128-t1 finding steamclient.so in /proc/self/maps\n");
+    Log::Info("CloudRedirect build %s 1779918128-t1", CR_VERSION_STRING);
 
     // Kill-switch: if disable file exists, bail without hooking
     const char* home = getenv("HOME");
@@ -187,19 +191,8 @@ static void DoInit()
     {
         DebugLog("[CR] DoInit: FAILED - transport vtable not found\n");
         Log::Error("Init failed: transport vtable not found");
-        Notify("Incompatible Steam client — hooks disabled", true);
+        Notify("Incompatible Steam client - hooks disabled", true);
         return;
-    }
-
-    // Validate slot pointers are within steamclient's address range
-    for (int slot : {5, 7, 8}) {
-        uintptr_t fn = reinterpret_cast<uintptr_t>(vtable[slot]);
-        if (fn < steamBase || fn >= steamBase + steamSize) {
-            DebugLog("[CR] DoInit: FAILED - vtable slot points outside steamclient\n");
-            Log::Error("Init failed: slot %d (%p) outside steamclient range, incompatible client", slot, (void*)fn);
-            Notify("Incompatible Steam client — hooks disabled", true);
-            return;
-        }
     }
 
     DebugLog("[CR] DoInit: saving originals\n");
@@ -224,6 +217,15 @@ static void DoInit()
     DebugLog("[CR] DoInit: resolving protobuf helpers\n");
     CloudHooks::ResolveProtobufHelpers(reinterpret_cast<void*>(steamBase), steamSize);
 
+    // Sweep stray *.cloudredirect metadata from userdata/{app}/remote/.
+    {
+        std::string steamPath = CloudIntercept::GetSteamPath();
+        if (!steamPath.empty())
+            LegacyMetadataCleanup::PruneSteamUserdata(steamPath);
+    }
+
+    SteamKvInjector::Init();
+
     g_initialized.store(true, std::memory_order_release);
     DebugLog("[CR] DoInit: SUCCESS\n");
     Log::Info("CloudRedirect initialized successfully");
@@ -239,7 +241,7 @@ static void ScanCrashHandler(int sig)
 {
     if (g_inScan)
         siglongjmp(g_crashJmpBuf, 1);
-    // Not our crash — SA_RESETHAND already restored default, just re-raise
+    // Not our crash -- SA_RESETHAND already restored default, just re-raise
     raise(sig);
 }
 
@@ -368,15 +370,13 @@ static bool SteamclientMapped()
 
 static void* DeferredInitThread(void*)
 {
-    // Poll for steamclient.so — under LD_PRELOAD we load before Steam has
+    // Poll for steamclient.so -- under LD_PRELOAD we load before Steam has
     // mapped steamclient, so a fixed delay is insufficient.
     DebugLog("[CR] DeferredInit: waiting for steamclient.so\n");
-    for (int i = 0; i < 120; i++) {  // up to 60 seconds
+    for (int i = 0; i < 20; i++) {  // up to 10 seconds
         if (SteamclientMapped()) break;
         usleep(500000);
     }
-    // Extra settle time for relocations to complete
-    usleep(1000000);
     DebugLog("[CR] DeferredInit: starting\n");
 
     // Install crash guard so a bad memory read aborts correctly
@@ -392,8 +392,8 @@ static void* DeferredInitThread(void*)
         DoInit();
     } else {
         DebugLog("[CR] DeferredInit: CRASHED during init, aborting safely\n");
-        Log::Error("Caught signal during init — incompatible steamclient? Hooks NOT installed.");
-        Notify("Crashed during init — hooks disabled", true);
+        Log::Error("Caught signal during init - incompatible steamclient? Hooks NOT installed.");
+        Notify("Crashed during init - hooks disabled", true);
     }
     g_inScan = 0;
 
@@ -415,7 +415,7 @@ __attribute__((constructor))
 static void OnLoad()
 {
     std::string proc = GetProcessName();
-    if (proc != "steam")
+    if (proc != "steam" && !SteamclientMapped())
         return;
 
     // Clean ourselves from LD_PRELOAD so child processes don't inherit us
@@ -449,6 +449,10 @@ static void OnUnload()
         }
     }
 
+    // Write final sync icon states to registry.vdf (last-write-wins after
+    // Steam's PosixRegistryManager has done its final in-memory flush).
+    CloudIntercept::FlushPendingSyncStates();
+
     // Shut down cloud storage (signals workers, drains queue with timeout)
     CloudStorage::Shutdown();
 
@@ -457,6 +461,7 @@ static void OnUnload()
 
     if (g_initialized.load(std::memory_order_acquire))
     {
+        CloudHooks::BeginShutdown();
         VtableHook::RemoveHooks(g_vtableInfo);
         VtableHook::RemoveCloudEnabledHook(g_cloudEnabledInfo);
         Log::Info("cloud_redirect.so unloaded");

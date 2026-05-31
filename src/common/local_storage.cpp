@@ -3,7 +3,6 @@
 #include "autocloud_util.h"
 #include "cloud_metadata_paths.h"
 #include "file_util.h"
-#include "local_metadata_store.h"
 #include "log.h"
 #include "steam_root_ids.h"
 
@@ -13,8 +12,6 @@ using CloudIntercept::kRootTokenFilename;
 using CloudIntercept::kLegacyRootTokenFilename;
 using CloudIntercept::kFileTokensFilename;
 using CloudIntercept::kLegacyFileTokensFilename;
-using CloudIntercept::kDeletedFilename;
-using CloudIntercept::kLegacyDeletedFilename;
 #ifdef _WIN32
 #include <wincrypt.h>
 #include <ShlObj.h>
@@ -28,6 +25,7 @@ using CloudIntercept::kLegacyDeletedFilename;
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <ctime>
@@ -105,13 +103,7 @@ static std::string GetAppPathInternal(uint32_t accountId, uint32_t appId) {
 }
 
 #ifdef CLOUDREDIRECT_TESTING
-// NOTE: These test helpers exercise the local copies of AutoCloud parsing functions
-// (ParseAppInfoKV, WildcardMatchInsensitive, ApplyRootOverridesForCurrentOS, etc.)
-// that remain in this file. Production scan code has been extracted to autocloud_scan.cpp
-// with identical implementations. These static functions are kept here because:
-// 1. They're used by other LocalStorage functions (e.g., LoadAutoCloudRules for caching)
-// 2. The test helpers verify the algorithms work correctly in isolation
-// 3. Removing them would require exposing internal helpers in the AutoCloudScan interface
+// Test helpers for the local copies of AutoCloud parsing functions.
 
 bool TestResolveAutoCloudRootOverride(const std::string& root, const std::string& path,
                                       const std::string& overrideRoot,
@@ -1191,8 +1183,19 @@ bool WriteFileNoIncrement(uint32_t accountId, uint32_t appId, const std::string&
         return false;
     }
 
+#ifdef _WIN32
+    SetLastError(0);
+#endif
     if (!FileUtil::AtomicWriteBinary(fullPath, data, len)) {
-        LOG("WriteFileNoIncrement failed: %s (%zu bytes)", fullPath.c_str(), len);
+#ifdef _WIN32
+        DWORD lastErr = GetLastError();
+        LOG("WriteFileNoIncrement failed: %s (%zu bytes, GetLastError=%lu)",
+            fullPath.c_str(), len, (unsigned long)lastErr);
+#else
+        int lastErr = errno;
+        LOG("WriteFileNoIncrement failed: %s (%zu bytes, errno=%d: %s)",
+            fullPath.c_str(), len, lastErr, strerror(lastErr));
+#endif
         return false;
     }
     LOG("WriteFileNoIncrement: app %u %s (%zu bytes)", appId, filename.c_str(), len);
@@ -1222,12 +1225,9 @@ bool DeleteFile(uint32_t accountId, uint32_t appId, const std::string& filename)
         uint64_t prevCN = g_changeNumbers[cnKey];
         g_changeNumbers[cnKey] = prevCN + 1;
         if (!SaveChangeNumberLocked(accountId, appId)) {
-            // File removed; tombstone at prevCN and roll back cache.
-            uint64_t cnAtDelete = prevCN;
             g_changeNumbers[cnKey] = prevCN;
-            LocalMetadataStore::MarkDeleted(accountId, appId, filename, cnAtDelete);
-            LOG("DeleteFile: cn.dat persist failed for app %u after removing %s; tombstoned at cn=%llu, rolled back CN",
-                appId, filename.c_str(), (unsigned long long)cnAtDelete);
+            LOG("DeleteFile: cn.dat persist failed for app %u after removing %s; rolled back CN",
+                appId, filename.c_str());
             return false;
         }
         LOG("DeleteFile: app %u %s", appId, filename.c_str());

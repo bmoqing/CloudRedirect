@@ -31,6 +31,9 @@ void InstallRecvPktMonitor(void* savedOrigPtrAddr);
 // install inline detour on steamclient64 for manifest pinning
 void InstallManifestPinHook();
 
+// Stub -- release-state patching removed from public builds.
+void InstallReleaseStateNop();
+
 // compute payload base and set up cave replacement buffer globals
 void SetSendPktAddr(void* recvPktGlobalAddr);
 
