@@ -168,7 +168,7 @@ bool SaveFileTokens(uint32_t accountId, uint32_t appId,
     toSave.reserve(fileTokens.size());
     size_t rejectedCount = 0;
     for (const auto& [cleanName, token] : fileTokens) {
-        if (validRootTokens.empty() || validRootTokens.count(token) ||
+        if (validRootTokens.empty() || token.empty() || validRootTokens.count(token) ||
             CloudIntercept::IsInternalMetadataFile(cleanName)) {
             toSave[cleanName] = token;
         } else {
@@ -252,7 +252,7 @@ std::unordered_map<std::string, std::string> LoadFileTokens(uint32_t accountId, 
     std::unordered_map<std::string, std::string> filtered;
     filtered.reserve(result.size());
     for (auto& [cleanName, token] : result) {
-        if (validRootTokens.count(token) || CloudIntercept::IsInternalMetadataFile(cleanName)) {
+        if (token.empty() || validRootTokens.count(token) || CloudIntercept::IsInternalMetadataFile(cleanName)) {
             filtered[cleanName] = token;
         }
     }

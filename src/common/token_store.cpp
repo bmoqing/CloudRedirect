@@ -102,7 +102,7 @@ bool SaveFileTokens(uint32_t accountId, uint32_t appId,
     std::unordered_map<std::string, std::string> filteredTokens;
     size_t rejectedCount = 0;
     for (const auto& [cleanName, token] : fileTokens) {
-        if (validRootTokens.empty() || validRootTokens.count(token) ||
+        if (validRootTokens.empty() || token.empty() || validRootTokens.count(token) ||
             CloudIntercept::IsInternalMetadataFile(cleanName)) {
             filteredTokens[cleanName] = token;
         } else {
@@ -164,7 +164,7 @@ std::unordered_map<std::string, std::string> LoadFileTokens(uint32_t accountId, 
         std::string cleanName = line.substr(0, tab);
         std::string token = line.substr(tab + 1);
         if (cleanName.empty()) continue;
-        if (!validRootTokens.empty() && !validRootTokens.count(token)) continue;
+        if (!validRootTokens.empty() && !token.empty() && !validRootTokens.count(token)) continue;
         cloudFileTokens[cleanName] = token;
     }
 

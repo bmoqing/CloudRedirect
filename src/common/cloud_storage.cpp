@@ -2143,7 +2143,7 @@ static bool SyncFromCloudInner(uint32_t accountId, uint32_t appId, bool isSweep)
                     if (cleanName.empty()) continue;
                     
                     // Validate: token must be in app's valid root token set
-                    if (!validRootTokens.empty() && !validRootTokens.count(token)) {
+                    if (!validRootTokens.empty() && !token.empty() && !validRootTokens.count(token)) {
                         LOG("[CloudStorage] SyncFromCloud app %u: rejecting cloud file token '%s' -> '%s' (not in valid root set)",
                             appId, cleanName.c_str(), token.c_str());
                         ++rejectedCount;
